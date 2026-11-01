@@ -10,7 +10,7 @@ for argument in "$@"; do
       cat <<'HELP'
 Usage: ./build_and_deploy.sh [--package-only]
 
-Builds the universal arm64/x86_64 Release app and writes dist/BotPlus-PDF-Editor.dmg.
+Builds the universal arm64/x86_64 Release app and writes dist/<version>/BotPlus-PDF-Editor.dmg.
 By default, commits source changes and pushes main to Davud77/BotPlus-PDF-Editor.
 --package-only builds and packages without changing Git or contacting GitHub.
 
@@ -29,7 +29,9 @@ done
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DERIVED_DATA="${BOTPLUS_DERIVED_DATA:-$PROJECT_ROOT/build/DerivedData}"
-DIST_DIRECTORY="$PROJECT_ROOT/dist"
+RELEASE_VERSION="$(sed -nE 's/.*MARKETING_VERSION = ([^;]+);.*/\1/p' "$PROJECT_ROOT/BotPlusPDFEditor.xcodeproj/project.pbxproj" | head -n 1)"
+[[ "$RELEASE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { printf 'Invalid release version.\n' >&2; exit 1; }
+DIST_DIRECTORY="$PROJECT_ROOT/dist/$RELEASE_VERSION"
 DMG_PATH="$DIST_DIRECTORY/BotPlus-PDF-Editor.dmg"
 REPOSITORY_URL="https://github.com/Davud77/BotPlus-PDF-Editor.git"
 COMMIT_MESSAGE="feat: add dynamic rulers, dockable panels, and editing tools"

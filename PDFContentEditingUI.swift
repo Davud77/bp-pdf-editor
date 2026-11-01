@@ -24,6 +24,8 @@ final class PDFContentPropertiesModel: ObservableObject {
     var apply: (() -> Void)?
     var delete: (() -> Void)?
     var replace: (() -> Void)?
+    var editNodes: (() -> Void)?
+    var arrange: ((Int) -> Void)?
     func load(_ object: PDFSourceSession.ContentObject) {
         active = true; kind = object.kind; geometry(object.bounds)
         rotation = 0; stroke = Color(nsColor: object.stroke ?? .black); fill = Color(nsColor: object.fill ?? .black)
@@ -38,7 +40,7 @@ final class PDFContentPropertiesModel: ObservableObject {
         guard styleChanged else { return nil }
         return .init(stroke: NSColor(stroke),fill: NSColor(fill),width: lineWidth,opacity: opacity,strokeEnabled: strokeEnabled,fillEnabled: fillEnabled,editStroke: strokeChanged,editFill: fillChanged,editOpacity: opacityChanged)
     }
-    func reset() { active = false; apply = nil; delete = nil; replace = nil }
+    func reset() { active = false; apply = nil; delete = nil; replace = nil; editNodes = nil; arrange = nil }
 }
 
 struct PDFContentPropertiesView: View {
@@ -81,6 +83,13 @@ struct PDFContentPropertiesView: View {
                 Button(text("Apply","Применить")) { model.apply?() }
                 Button(text("Delete","Удалить")) { model.delete?() }
             }
+            Menu(text("Arrange", "Порядок наложения")) {
+                Button(text("Bring to front", "На передний план")) { model.arrange?(2) }
+                Button(text("Bring forward", "Вперёд")) { model.arrange?(1) }
+                Button(text("Send backward", "Назад")) { model.arrange?(-1) }
+                Button(text("Send to back", "На задний план")) { model.arrange?(-2) }
+            }
+            if model.kind == "path" { Button(text("Edit nodes…", "Редактировать узлы…")) { model.editNodes?() } }
             if model.kind == "image" { Button(text("Replace image…","Заменить изображение…")) { model.replace?() } }
             if model.kind == "group" { Text(text("Children of shared XObjects remain intact. The group is transformed as one object.","Дочерние элементы общего XObject сохраняются. Группа преобразуется как один объект.")).font(.system(size: 10)).foregroundStyle(.secondary) }
             Text(text("Drag inside to move, corners to resize, circle above to rotate.","Внутри рамки — перемещение, углы — размер, круг сверху — поворот.")).font(.system(size: 10)).foregroundStyle(.secondary)

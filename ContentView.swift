@@ -7,10 +7,11 @@ import PDFKit
 import AVFoundation
 import CoreText
 import UniformTypeIdentifiers
+import Combine
 
 private enum BotPlusBrand {
     static let name = "BotPlus PDF Editor"
-    static let version = "1.7"
+    static let version = "1.9"
     static let copyright = "© 2026 BotPlus"
     static let supportURL = URL(string: "https://github.com/Davud77/BotPlus-PDF-Editor")!
     static let telegramURL = URL(string: "https://t.me/botplus_pdf")!
@@ -96,9 +97,14 @@ private enum RibbonTab: CaseIterable, Identifiable {
 }
 
 private enum PDFTool: Equatable {
+    case distance, perimeter, area, calibration
     case hand, textSelection, selectComments, highlight, underline, strike, typewriter, rectangle, ellipse, cloud, pencil, eraser, line, arrow, callout, note, stamp, link, marquee, snapshot, formText, formCheckbox, formRadio, formChoice, formButton, addText, editText, editContent
     var title: Bilingual {
         switch self {
+        case .distance: Bilingual(en: "Distance",ru: "Расстояние")
+        case .perimeter: Bilingual(en: "Perimeter",ru: "Периметр")
+        case .area: Bilingual(en: "Area",ru: "Площадь")
+        case .calibration: Bilingual(en: "Calibrate scale",ru: "Калибровать масштаб")
         case .hand: Bilingual(en: "Hand", ru: "Рука")
         case .textSelection: Bilingual(en: "Text Selection", ru: "Выделить текст")
         case .selectComments: Bilingual(en: "Select Comments", ru: "Выделить комментарии")
@@ -157,12 +163,13 @@ private enum PageLayout: CaseIterable, Identifiable {
 }
 
 private enum WorkspacePanel: String, CaseIterable, Identifiable, Codable {
-    case thumbnails, bookmarks, properties, comments, layers, attachments
+    case thumbnails, bookmarks, search, properties, comments, layers, attachments
     var id: String { rawValue }
     var title: Bilingual {
         switch self {
         case .thumbnails: Bilingual(en: "Thumbnails", ru: "Миниатюры страниц")
         case .bookmarks: Bilingual(en: "Bookmarks", ru: "Закладки")
+        case .search: Bilingual(en: "Search", ru: "Поиск")
         case .properties: Bilingual(en: "Properties", ru: "Свойства")
         case .comments: Bilingual(en: "Comments / Annotations", ru: "Комментарии")
         case .layers: Bilingual(en: "Layers", ru: "Слои")
@@ -173,6 +180,7 @@ private enum WorkspacePanel: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .thumbnails: "square.grid.2x2"
         case .bookmarks: "bookmark"
+        case .search: "magnifyingglass"
         case .properties: "slider.horizontal.3"
         case .comments: "text.bubble"
         case .layers: "square.3.layers.3d"
@@ -250,6 +258,7 @@ private final class PanelWorkspaceModel: NSObject, ObservableObject, NSWindowDel
         let defaults: [WorkspacePanel: PanelConfiguration] = [
             .thumbnails: .init(isVisible: true, dock: .left, width: 230),
             .bookmarks: .init(isVisible: true, dock: .left, width: 240),
+            .search: .init(isVisible: false, dock: .left, width: 300),
             .properties: .init(isVisible: true, dock: .right, width: 250),
             .comments: .init(isVisible: false, dock: .right, width: 260),
             .layers: .init(isVisible: false, dock: .left, width: 220),
@@ -399,49 +408,74 @@ private final class PanelWorkspaceModel: NSObject, ObservableObject, NSWindowDel
 }
 
 @MainActor
-private final class PDFDocumentItem: ObservableObject, Identifiable {
+private final class SharedPDFDocument: ObservableObject {
     let id = UUID()
-    @Published var url: URL {
-        didSet { accessLease = FileAccessLease(url) }
-    }
+    @Published var url: URL { didSet { accessLease = FileAccessLease(url) } }
     private var accessLease: FileAccessLease
     @Published var document: PDFDocument
+    @Published var isUntitled = false
+    @Published var revision = 0
+    var savedRevision = 0
+    var savedStamp: Int
+    var undoHistory: [PDFDocumentItem.Snapshot] = [], redoHistory: [PDFDocumentItem.Snapshot] = []
+    var historyGroup = "", historyDate = Date.distantPast
+    var recoveredFilename: String?, rootSourceData: Data?
+    var streamIdentity: ObjectIdentifier?, streamPages: [ObjectIdentifier] = [], streamRoot: Int?
+    init(url: URL,document: PDFDocument) { self.url = url; self.document = document; accessLease = FileAccessLease(url); savedStamp = PDFDocumentState.stamp(document) }
+    var hasChanges: Bool { isUntitled || revision != savedRevision || savedStamp != PDFDocumentState.stamp(document) }
+}
+@MainActor
+private final class PDFDocumentItem: ObservableObject, Identifiable {
+    let id = UUID(), store: SharedPDFDocument
+    private var storeObservation: AnyCancellable?
     @Published var pageIndex = 0
     @Published var zoom: CGFloat = 1
-    @Published var isUntitled = false
+    @Published var selectedPages = Set<Int>()
+    var thumbnailAnchor: Int?
     struct Snapshot { let data: Data; let page: Int; let zoom: CGFloat; let bookmarks: [PDFBookmarkStore.Record]? }
-    var undoHistory: [Snapshot] = []
-    var redoHistory: [Snapshot] = []
+    var url: URL { get { store.url } set { store.url = newValue } }
+    var document: PDFDocument { get { store.document } set { store.document = newValue } }
+    var isUntitled: Bool { get { store.isUntitled } set { store.isUntitled = newValue } }
+    var undoHistory: [Snapshot] { get { store.undoHistory } set { store.undoHistory = newValue } }
+    var redoHistory: [Snapshot] { get { store.redoHistory } set { store.redoHistory = newValue } }
+    var historyGroup: String { get { store.historyGroup } set { store.historyGroup = newValue } }
+    var historyDate: Date { get { store.historyDate } set { store.historyDate = newValue } }
+    var rootSourceData: Data? { get { store.rootSourceData } set { store.rootSourceData = newValue } }
+    var recoveredFilename: String? { get { store.recoveredFilename } set { store.recoveredFilename = newValue } }
     let navigation = PDFNavigationHistory()
     var navigationPageCount = 0
-    var historyGroup = ""
-    var historyDate = Date.distantPast
-    private var streamIdentity: ObjectIdentifier?
-    private var streamPages: [ObjectIdentifier] = []
-    private var streamRoot: Int?
-
-    init(url: URL, document: PDFDocument,preserveStreams: Bool = false) {
-        self.url = url; self.document = document; accessLease = FileAccessLease(url)
-        if preserveStreams { enableStreamPreservation() }
+    init(url: URL,document: PDFDocument,preserveStreams: Bool = false) {
+        store = SharedPDFDocument(url: url,document: document)
+        observeStore(); if preserveStreams { enableStreamPreservation() }
     }
+    init(shared: SharedPDFDocument,page: Int,zoom: CGFloat) { store = shared; pageIndex = page; self.zoom = zoom; observeStore() }
+    private func observeStore() { storeObservation = store.objectWillChange.sink { [weak self] _ in MainActor.assumeIsolated { self?.objectWillChange.send() } } }
     func enableStreamPreservation() {
-        streamIdentity = ObjectIdentifier(document)
-        streamPages = (0..<pageCount).compactMap { document.page(at: $0).map(ObjectIdentifier.init) }
-        streamRoot = PDFDocumentState.rootStamp(document)
+        store.streamIdentity = ObjectIdentifier(document)
+        store.streamPages = (0..<pageCount).compactMap { document.page(at: $0).map(ObjectIdentifier.init) }
+        store.streamRoot = PDFDocumentState.rootStamp(document)
     }
-    var canPreserveStreams: Bool {
-        streamIdentity == ObjectIdentifier(document) && streamRoot == PDFDocumentState.rootStamp(document) && streamPages == (0..<pageCount).compactMap { document.page(at: $0).map(ObjectIdentifier.init) }
-    }
-    var recoveredFilename: String?
+    var canPreserveStreams: Bool { store.streamIdentity == ObjectIdentifier(document) && store.streamRoot == PDFDocumentState.rootStamp(document) && store.streamPages == (0..<pageCount).compactMap { document.page(at: $0).map(ObjectIdentifier.init) } }
     var filename: String { isUntitled ? recoveredFilename ?? "Untitled.pdf" : url.lastPathComponent }
     var pageCount: Int { document.pageCount }
 }
 
 @MainActor
 private final class DocumentManager: ObservableObject {
-    let panels = PanelWorkspaceModel()
+    let panels: PanelWorkspaceModel
     let recent: RecentPDFStore
-    init(recent: RecentPDFStore = .shared) { self.recent = recent }
+    init(recent: RecentPDFStore = .shared,panels: PanelWorkspaceModel = PanelWorkspaceModel()) { self.recent = recent; self.panels = panels }
+    @Published var splitManager: DocumentManager?
+    @Published var splitHorizontal = true
+    @Published var splitFocused = false
+    weak var parentManager: DocumentManager?
+    var activePane: DocumentManager { splitFocused ? splitManager ?? self : self }
+    private var documentObservations: [AnyCancellable] = []
+    private func observeDocuments() {
+        documentObservations = documents.map { item in item.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.refreshPresentation() }
+        } }
+    }
     @Published var formattingRequest: PDFFormattingRequest?
     @Published var graphicMarkRequest: PDFGraphicMarkRequest?
     @Published var pageWorkflowRequest: PDFPageWorkflowRequest?
@@ -451,6 +485,56 @@ private final class DocumentManager: ObservableObject {
     @Published var snapshotImage: NSImage?
     var snapshotPNG: Data?
     @Published var isSpacingPresented = false
+    @Published var isRibbonCustomizationPresented = false
+    @Published var geometryRequest: PageGeometryRequest?
+    @Published var regionRequest: PDFRegionRequest?
+    @Published var printRequest: PDFPrintRequest?
+    @Published var spellRequest: PDFSpellRequest?
+    @Published var securityRequest: PDFSecurityRequest?
+    @Published var headingRequest: PDFHeadingRequest?
+    @Published var bookmarkTextRequest: PDFBookmarkTextRequest?
+    @Published var bookmarkValidationRequest: PDFBookmarkValidationRequest?
+    @Published var tocRequest: PDFTOCRequest?
+    @Published var formOrderRequest: PDFFormOrderRequest?
+    @Published var tabTraversalRequest: PDFTabTraversalRequest?
+    @Published var engineeringScaleRequest: EngineeringScaleRequest?
+    @Published var annotationVertexRequest: PDFAnnotationVertexRequest?
+    @Published var annotationScaleRequest: PDFAnnotationScaleRequest?
+    @Published var annotationRotationRequest: PDFAnnotationRotationRequest?
+    @Published var formValuesRequest: PDFFormValuesRequest?
+    @Published var formRuleRequest: PDFFormRuleRequest?
+    @Published var formValidationRequest: PDFFormValidationRequest?
+    @Published var ocrReviewRequest: PDFOCRReviewRequest?
+    @Published var scannerRequest: PDFScannerRequest?
+    @Published var rasterRequest: PDFRasterRequest?
+    @Published var comparisonRequest: PDFComparisonRequest?
+    @Published var officeRequest: PDFOfficeRequest?
+    @Published var structureRequest: PDFStructureRequest?
+    @Published var pathRequest: PDFPathRequest?
+    @Published var namedRequest: PDFNamedRequest?
+    @Published var layerEntries: [PDFLayerInfo] = []
+    @Published var layerOutline: [PDFLayerRow] = []
+    @Published var layerHasOrder = false
+    @Published var layerPresets: [PDFLayerPreset] = []
+    @Published var layerPresetRequest: PDFLayerPresetRequest?
+    @Published var layerStateRequest: PDFLayerStateRequest?
+    @Published var layerRadioRequest: PDFLayerRadioRequest?
+    @Published var layerOrderRequest: PDFLayerOrderRequest?
+    @Published var layerPolicyRequest: PDFLayerPolicyRequest?
+    @Published var membershipRequest: PDFMembershipRequest?
+    @Published var membershipBindingRequest: PDFMembershipBindingRequest?
+    @Published var xObjectConditionRequest: PDFXObjectConditionRequest?
+    @Published var formResourceTransformRequest: PDFFormResourceTransformRequest?
+    @Published var engineeringTransformRequest: EngineeringTransformRequest?
+    @Published var engineeringTransferRequest: EngineeringTransferRequest?
+    @Published var engineeringDirectionRequest: EngineeringDirectionRequest?
+    @Published var engineeringLabelRequest: EngineeringLabelRequest?
+    @Published var layerError: String?
+    var layerSnapshot: (data: Data,document: ObjectIdentifier,stamp: Int)?
+    var afterFeatureDismiss: (() -> Void)?
+    @Published var attachments: [PDFAttachmentEntry] = []
+    @Published var attachmentError: String?
+    @Published var snapshotSource: (id: UUID, page: Int, region: CGRect)?
     @Published var pageGap = PDFPageSpacing.clamp(UserDefaults.standard.object(forKey: "BotPlus.pageGap") as? Double ?? 4) {
         didSet { UserDefaults.standard.set(pageGap,forKey: "BotPlus.pageGap") }
     }
@@ -469,11 +553,20 @@ private final class DocumentManager: ObservableObject {
     private var serializedBytes: Data?
     private(set) var serializationCount = 0
 
-    @Published private(set) var documents: [PDFDocumentItem] = []
+    @Published private(set) var documents: [PDFDocumentItem] = [] { didSet { observeDocuments() } }
     @Published var selectedID: UUID?
-    @Published var language: AppLanguage = .ru
+    @Published var language: AppLanguage = .ru {
+        didSet {
+            if let parentManager,parentManager.language != language { parentManager.language = language }
+            if let splitManager,splitManager.language != language { splitManager.language = language }
+        }
+    }
     @Published var theme: AppTheme = AppTheme(rawValue: UserDefaults.standard.string(forKey: "BotPlusPDFEditor.theme") ?? "dark") ?? .dark {
-        didSet { UserDefaults.standard.set(theme.rawValue, forKey: "BotPlusPDFEditor.theme") }
+        didSet {
+            UserDefaults.standard.set(theme.rawValue, forKey: "BotPlusPDFEditor.theme")
+            if let parentManager,parentManager.theme != theme { parentManager.theme = theme }
+            if let splitManager,splitManager.theme != theme { splitManager.theme = theme }
+        }
     }
     @Published var thumbnailZoom = 1.0
     @Published var thumbnailGestureActive = false
@@ -482,7 +575,8 @@ private final class DocumentManager: ObservableObject {
     private var embeddedTextRevision = -1
     private var embeddedTextData: Data?
     private var embeddedTextCache: [Int:String] = [:]
-    var contentRevision = 0
+    private var localRevision = 0
+    var contentRevision: Int { get { selected?.store.revision ?? localRevision } set { if let selected { selected.store.revision = newValue } else { localRevision = newValue } } }
     @Published var selectedOutline: PDFOutline?
     @Published var stampText = "СОГЛАСОВАНО"
     @Published var annotationFill = false
@@ -491,6 +585,8 @@ private final class DocumentManager: ObservableObject {
     @Published var tool: PDFTool = .hand
     @Published var layout: PageLayout = .continuous
     @Published var rulersVisible = false
+    @Published var engineeringSnap = true
+    @Published var engineeringUnit = EngineeringUnit.m
     @Published var rulerUnit: RulerUnit = .millimeters
     let viewport = ViewportState()
     let textProperties = PDFTextPropertiesModel()
@@ -505,15 +601,93 @@ private final class DocumentManager: ObservableObject {
     @Published var textFontSize: Double = 18
     @Published var textBorderEnabled = true
     @Published var selectedAnnotation: PDFAnnotation?
+    @Published var selectedAnnotationCount = 0
     @Published var selectedContent: PDFSourceSession.ContentObject?
     @Published var pageText = "1"
-    @Published var searchText = ""
+    @Published var searchText = "" { didSet { if searchText != oldValue { clearSearch() } } }
     @Published var searchRequestID = 0
+    struct SearchMatch: Identifiable {
+        let id: Int
+        let page: Int
+        let snippet: String
+        let selection: PDFSelection
+    }
+    @Published var searchMatches: [SearchMatch] = []
+    @Published var searchMatchID: Int?
+    @Published var searchRunning = false
+    @Published var searchCompleted = false
+    @Published var searchNavigationID = 0
+    private var searchTask: Task<Void, Never>?
+    private var searchGeneration = 0
+    private var searchDocument: PDFDocument?
+    private var searchRevision = -1
+    var currentSearchSelection: PDFSelection? {
+        guard let item = selected, item.document === searchDocument, item.store.revision == searchRevision else { return nil }
+        return searchMatches.first { $0.id == searchMatchID }?.selection
+    }
+    func clearSearch() {
+        searchGeneration &+= 1; searchTask?.cancel(); searchTask = nil
+        searchMatches = []; searchMatchID = nil; searchRunning = false; searchCompleted = false
+        searchDocument = nil; searchRevision = -1
+        searchNavigationID &+= 1
+    }
+    func invalidateStaleSearch() {
+        if let searchDocument, selected?.document !== searchDocument || selected?.store.revision != searchRevision { clearSearch() }
+    }
+    func runSearch() {
+        clearSearch(); panels.select(.search)
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, let item = selected else { return }
+        let document = item.document, revision = item.store.revision, generation = searchGeneration
+        searchDocument = document; searchRevision = revision; searchRunning = true
+        searchTask = Task { @MainActor [weak self] in
+            for index in 0..<document.pageCount {
+                await Task.yield()
+                guard let self, !Task.isCancelled, self.searchGeneration == generation else { return }
+                guard self.selected?.document === document, item.store.revision == revision else { self.clearSearch(); return }
+                guard let page = document.page(at: index), let text = page.string else { continue }
+                let source = text as NSString
+                var cursor = 0
+                var batch: [SearchMatch] = []
+                while cursor < source.length {
+                    let range = source.range(of: query, options: .caseInsensitive, range: NSRange(location: cursor, length: source.length - cursor))
+                    guard range.location != NSNotFound, range.length > 0 else { break }
+                    if let selection = page.selection(for: range) {
+                        let start = max(0, range.location - 45), end = min(source.length, NSMaxRange(range) + 65)
+                        let context = source.rangeOfComposedCharacterSequences(for: NSRange(location: start, length: end - start))
+                        let snippet = source.substring(with: context).components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+                        batch.append(SearchMatch(id: self.searchMatches.count + batch.count, page: index, snippet: (start > 0 ? "…" : "") + snippet + (end < source.length ? "…" : ""), selection: selection))
+                    }
+                    cursor = NSMaxRange(range)
+                    if batch.count.isMultiple(of: 200) {
+                        await Task.yield()
+                        guard !Task.isCancelled, self.searchGeneration == generation else { return }
+                        guard self.selected?.document === document, item.store.revision == revision else { self.clearSearch(); return }
+                    }
+                }
+                self.searchMatches.append(contentsOf: batch)
+                if self.searchMatchID == nil, let first = self.searchMatches.first { self.selectSearchMatch(first.id) }
+            }
+            guard let self, self.searchGeneration == generation, !Task.isCancelled else { return }
+            self.searchRunning = false; self.searchCompleted = true; self.searchTask = nil
+        }
+    }
+    func selectSearchMatch(_ id: Int) {
+        invalidateStaleSearch()
+        guard searchMatches.contains(where: { $0.id == id }) else { return }
+        searchMatchID = id; searchNavigationID &+= 1; refreshPresentation()
+    }
+    func stepSearch(_ delta: Int) {
+        guard !searchMatches.isEmpty else { return }
+        let index = searchMatches.firstIndex { $0.id == searchMatchID } ?? 0
+        selectSearchMatch(searchMatches[(index + delta % searchMatches.count + searchMatches.count) % searchMatches.count].id)
+    }
     @Published var notice: String?
     @Published var commandIndex = 0
     @Published var command: ViewerCommand = .refresh
     var rulerMetrics: RulerMetrics { get { viewport.metrics } set { viewport.metrics = newValue } }
     var finishSourceEditing: (() -> Bool)?
+    var isClosingTabs = false
     var captureNavigation: (() -> Void)?
     @Published var isAboutPresented = false
 
@@ -576,9 +750,10 @@ private final class DocumentManager: ObservableObject {
     }
 
     func select(_ id: UUID) {
+        parentManager?.splitFocused = true
         guard selectedID == id || finishSourceEditing?() != false else { return }
         if selectedID != id { selectedOutline = nil; selectedContent = nil; selectedAnnotation = nil; hasTextSelection = false; contentProperties.reset(); textProperties.reset() }
-        if selectedID != id { captureNavigation?() }
+        if selectedID != id { captureNavigation?(); clearSearch() }
         selectedID = id
         pageText = String((documents.first(where: { $0.id == id })?.pageIndex ?? 0) + 1)
         refreshPresentation()
@@ -599,15 +774,21 @@ private final class DocumentManager: ObservableObject {
     func serializedData(_ item: PDFDocumentItem) throws -> Data {
         let identity = ObjectIdentifier(item.document)
         let stamp = PDFDocumentState.stamp(item.document)
-        if serializedIdentity == identity,serializedRevision == contentRevision,serializedStamp == stamp,let data = serializedBytes { return data }
-        let data = try PDFDocumentSerializer.data(item.document,preserveStreams: item.canPreserveStreams)
-        serializationCount += 1; serializedIdentity = identity; serializedRevision = contentRevision
+        if serializedIdentity == identity,serializedRevision == item.store.revision,serializedStamp == stamp,let data = serializedBytes { return data }
+        var data = try PDFDocumentSerializer.data(item.document,preserveStreams: item.canPreserveStreams)
+        if let root = item.rootSourceData {
+            if PDFDocument(data: root)?.isEncrypted == true {
+                guard item.canPreserveStreams else { throw PDFSourceError.permission }
+            } else { data = try PDFDocumentExtras.preserveAttachments(from: root,in: data) }
+        }
+        serializationCount += 1; serializedIdentity = identity; serializedRevision = item.store.revision
         serializedStamp = stamp
         serializedBytes = data.count <= 64*1024*1024 ? data : nil
         return data
     }
     func seedSerializedData(_ data: Data,item: PDFDocumentItem) {
-        serializedIdentity = ObjectIdentifier(item.document); serializedRevision = contentRevision
+        item.rootSourceData = data
+        serializedIdentity = ObjectIdentifier(item.document); serializedRevision = item.store.revision
         serializedStamp = PDFDocumentState.stamp(item.document)
         serializedBytes = data.count <= 64*1024*1024 ? data : nil
     }
@@ -630,7 +811,7 @@ private final class DocumentManager: ObservableObject {
         guard finishSourceEditing?() != false else { return }
         guard let selected else { say("Open a PDF first.", "Сначала откройте PDF-файл."); return }
         if selected.isUntitled { saveDocumentAs(); return }
-        do { try PDFDocumentSerializer.write(try serializedData(selected),to: selected.url); recent.remember(selected.url) }
+        do { try PDFDocumentSerializer.write(try serializedData(selected),to: selected.url); selected.store.savedRevision = selected.store.revision; selected.store.savedStamp = PDFDocumentState.stamp(selected.document); recent.remember(selected.url) }
         catch { say("Could not save the PDF.","Не удалось сохранить PDF-файл.") }
     }
     func saveDocumentAs() {
@@ -645,7 +826,7 @@ private final class DocumentManager: ObservableObject {
                 guard let self else { return }
                 do { try PDFDocumentSerializer.write(try self.serializedData(selected),to: url) }
                 catch { self.say("Could not save the PDF.","Не удалось сохранить PDF-файл."); return }
-                selected.url = url; selected.isUntitled = false; self.recent.remember(url); self.refreshPresentation()
+                selected.url = url; selected.isUntitled = false; selected.store.savedRevision = selected.store.revision; selected.store.savedStamp = PDFDocumentState.stamp(selected.document); self.recent.remember(url); self.refreshPresentation()
             }
         }
     }
@@ -655,14 +836,17 @@ private final class DocumentManager: ObservableObject {
     }
     func perform(_ action: RibbonAction) {
         guard canPerform(action) else { return }
+        if let (target, command) = thumbnailTarget(for: action) { target.performThumbnailCommand(command); return }
         if case .feature(let id) = action {
+            if id == "search" { panels.select(.search); return }
             if id == "license" { isLicensePresented = true; return }
             if id == "updates" { checkUpdates(); return }
             if id == "spacing" { isSpacingPresented = true; return }
             if id == "undo" || id == "redo" { undoDocument(redo: id == "redo"); return }
             if id == "blank" { createBlankDocument(); return }
             if id == "newWindow" { PDFWindowPool.shared.open(); return }
-            if id == "customize" || id == "scanner" { say("Feature in development","Функция в разработке"); return }
+            if id == "customize" { isRibbonCustomizationPresented = true; return }
+            if id == "scanner" { openScanner(); return }
             if id == "fromFiles" { createFromFiles(); return }
         }
         if selected == nil {
@@ -675,7 +859,7 @@ private final class DocumentManager: ObservableObject {
         case .open: openPanel()
         case .save: saveDocument()
         case .saveAs: saveDocumentAs()
-        case .close: if let selected { close(selected.id) }
+        case .close: if let selected { closeTabs([selected.id]) }
         case .print: printDocument()
         case .settings: tab = .help
         case .tool(let next):
@@ -729,17 +913,34 @@ private final class DocumentManager: ObservableObject {
 
 @MainActor
 private enum AnnotationMetadata {
+    static func isLocked(_ annotation: PDFAnnotation) -> Bool {
+        let flags = (annotation.value(forAnnotationKey: .flags) as? NSNumber)?.intValue ?? 0
+        return flags & ((1 << 6) | (1 << 7) | (1 << 9)) != 0
+    }
+    static func setLocked(_ value: Bool,on annotation: PDFAnnotation) {
+        var flags = (annotation.value(forAnnotationKey: .flags) as? NSNumber)?.intValue ?? 0
+        let mask = (1 << 6) | (1 << 7) | (1 << 9)
+        if value { flags |= mask } else { flags &= ~mask }
+        annotation.setValue(NSNumber(value: flags),forAnnotationKey: .flags)
+    }
     struct Record: Codable {
         var id = UUID().uuidString
         var opacity: Double
         var group: String?
         var decoration: String?
+        var measurement: EngineeringMeasure?
+        var formSelections: [String]?
+        var formRule: PDFFormRule?
+        var inkCurves: PDFInkCurveRecord?
     }
     private struct Entry: Codable {
         let index: Int
         let subtype: String
         let center: CGPoint
         let record: Record
+        // PDFKit may normalize MediaBox to (0, 0) and translate annotations.
+        // Optional so files written before coordinate-origin tracking still open.
+        let mediaOrigin: CGPoint?
     }
     private final class Box: NSObject {
         var record: Record
@@ -747,6 +948,35 @@ private enum AnnotationMetadata {
     }
     private static let records = NSMapTable<PDFAnnotation, Box>.weakToStrongObjects()
     private static let prefix = "BotPlus PDF Editor metadata v1:"
+    static func measurement(_ annotation: PDFAnnotation) -> EngineeringMeasure? { records.object(forKey: annotation)?.record.measurement }
+    static func inkCurves(_ annotation: PDFAnnotation) -> PDFInkCurveRecord? { records.object(forKey: annotation)?.record.inkCurves }
+    static func setInkCurves(_ value: PDFInkCurveRecord?,on annotation: PDFAnnotation) {
+        var record = records.object(forKey: annotation)?.record ?? Record(opacity: Double(annotation.color.alphaComponent))
+        record.inkCurves = value; records.setObject(Box(record),forKey: annotation)
+    }
+    static func formRule(_ annotation: PDFAnnotation) -> PDFFormRule? { records.object(forKey: annotation)?.record.formRule }
+    static func setFormRule(_ rule: PDFFormRule,on annotation: PDFAnnotation) {
+        var record = records.object(forKey: annotation)?.record ?? Record(opacity: Double(annotation.color.alphaComponent))
+        record.formRule = rule; records.setObject(Box(record),forKey: annotation)
+    }
+    static func formSelections(_ annotation: PDFAnnotation) -> [String]? {
+        guard let values = records.object(forKey: annotation)?.record.formSelections,
+              (annotation.value(forAnnotationKey: .widgetValue) as? String ?? "") == values.first ?? "" else { return nil }
+        return values
+    }
+    static func setFormSelections(_ values: [String],on annotation: PDFAnnotation) {
+        var record = records.object(forKey: annotation)?.record ?? Record(opacity: Double(annotation.color.alphaComponent))
+        record.formSelections = values; records.setObject(Box(record),forKey: annotation)
+        annotation.widgetStringValue = values.first ?? ""
+    }
+    static func clearFormSelections(_ annotation: PDFAnnotation) {
+        guard var record = records.object(forKey: annotation)?.record else { return }
+        record.formSelections = nil; records.setObject(Box(record),forKey: annotation)
+    }
+    static func setMeasurement(_ value: EngineeringMeasure,on annotation: PDFAnnotation) {
+        var record = records.object(forKey: annotation)?.record ?? Record(opacity: Double(annotation.color.alphaComponent))
+        record.measurement = value; records.setObject(Box(record),forKey: annotation)
+    }
     static func alpha(of annotation: PDFAnnotation) -> CGFloat {
         if let record = records.object(forKey: annotation)?.record { return CGFloat(record.opacity) }
         return annotation.color.alphaComponent
@@ -769,7 +999,7 @@ private enum AnnotationMetadata {
         ["Text", "FreeText", "Popup"].contains(annotation.type ?? "") && (annotation.contents ?? "").hasPrefix(prefix)
     }
     static func isContainer(_ annotation: PDFAnnotation) -> Bool {
-        isOpacityContainer(annotation) || (!annotation.shouldDisplay && !annotation.shouldPrint && PDFSourceSession.isLayoutMetadata(annotation.contents ?? ""))
+        isOpacityContainer(annotation) || (annotation.contents ?? "").hasPrefix("BotPlus engineering calibration v1:") || (!annotation.shouldDisplay && !annotation.shouldPrint && PDFSourceSession.isLayoutMetadata(annotation.contents ?? ""))
     }
     // PDFKit's writer omits custom dictionary keys. A hidden, non-printing FreeText
     // annotation carries editor settings while standard visible annotations stay editable.
@@ -779,7 +1009,7 @@ private enum AnnotationMetadata {
             for annotation in page.annotations where isOpacityContainer(annotation) { removeContainer(annotation, from: page) }
             let entries = page.annotations.filter { !isContainer($0) }.enumerated().compactMap { index, annotation -> Entry? in
                 guard let record = records.object(forKey: annotation)?.record else { return nil }
-                return Entry(index: index, subtype: annotation.type ?? "", center: CGPoint(x: annotation.bounds.midX, y: annotation.bounds.midY), record: record)
+                return Entry(index: index, subtype: annotation.type ?? "", center: CGPoint(x: annotation.bounds.midX, y: annotation.bounds.midY), record: record,mediaOrigin: page.bounds(for: .mediaBox).origin)
             }
             guard !entries.isEmpty, let data = try? JSONEncoder().encode(entries) else { continue }
             let marker = PDFAnnotation(bounds: CGRect(x: page.bounds(for: .cropBox).minX, y: page.bounds(for: .cropBox).minY, width: 1, height: 1), forType: .freeText, withProperties: nil)
@@ -811,14 +1041,18 @@ private enum AnnotationMetadata {
                       let data = Data(base64Encoded: String(contents.dropFirst(prefix.count))),
                       let entries = try? JSONDecoder().decode([Entry].self, from: data) else { continue }
                 for entry in entries {
+                    let currentOrigin = page.bounds(for: .mediaBox).origin,oldOrigin = entry.mediaOrigin ?? currentOrigin
+                    let dx = currentOrigin.x-oldOrigin.x,dy = currentOrigin.y-oldOrigin.y
                     func matches(_ i: Int) -> Bool {
                         guard annotations.indices.contains(i), !used.contains(i), annotations[i].type == entry.subtype else { return false }
                         let bounds = annotations[i].bounds
-                        return hypot(bounds.midX - entry.center.x, bounds.midY - entry.center.y) < 8
+                        return hypot(bounds.midX - entry.center.x-dx, bounds.midY - entry.center.y-dy) < 8
                     }
                     guard let match = matches(entry.index) ? entry.index : annotations.indices.first(where: matches) else { continue }
                     let annotation = annotations[match]; used.insert(match)
-                    records.setObject(Box(entry.record), forKey: annotation)
+                    var record = entry.record
+                    if var measure = record.measurement { measure.points = measure.points.map { CGPoint(x: $0.x+dx,y: $0.y+dy) }; record.measurement = measure }
+                    records.setObject(Box(record), forKey: annotation)
                     if annotation.type != "Stamp" { annotation.removeValue(forAnnotationKey: .appearanceDictionary) }
                     if annotation.type == "FreeText" {
                         annotation.color = .clear
@@ -866,7 +1100,21 @@ private enum RibbonAction {
 
 @MainActor
 private extension DocumentManager {
+    func thumbnailTarget(for action: RibbonAction) -> ((any PDFThumbnailCommandTarget), String)? {
+        guard let target = NSApp.keyWindow?.firstResponder as? any PDFThumbnailCommandTarget,
+              target.thumbnailDocumentID == selected?.id else { return nil }
+        let command: String
+        switch action {
+        case .copy: command = "copy"
+        case .cut: command = "cut"
+        case .paste: command = "paste"
+        case .deleteSelection: command = "delete"
+        default: return nil
+        }
+        return (target, command)
+    }
     func canPerform(_ action: RibbonAction) -> Bool {
+        if let (target, command) = thumbnailTarget(for: action) { return target.canPerformThumbnailCommand(command) }
         switch action {
         case .open,.settings,.toggleLanguage,.toggleRulers,.panels,.languagePicker,.themePicker,.about,.support,.telegram: return true
         case .feature(let id) where ["license","updates","blank","fromFiles","scanner","newWindow","customize","spacing"].contains(id): return true
@@ -1001,9 +1249,21 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let updater = AppUpdateController.shared
-        guard updater.installationArmed else { return .terminateNow }
+        guard updater.installationArmed else {
+            let owners = [manager]+(manager.splitManager.map { [$0] } ?? [])+PDFWindowPool.shared.allManagers
+            guard owners.allSatisfy({ $0.loadingFiles == 0 && $0.operationTask == nil && $0.finishSourceEditing?() != false }) else { manager.say("Finish or cancel document operations before quitting.","Завершите или отмените операции перед выходом."); return .terminateCancel }
+            var seen = Set<UUID>()
+            let dirty = owners.flatMap(\.documents).filter { seen.insert($0.store.id).inserted && $0.store.hasChanges }
+            guard !dirty.isEmpty else { return .terminateNow }
+            let alert = NSAlert(); alert.messageText = manager.language == .ru ? "Выйти без сохранения изменений?" : "Quit without saving changes?"
+            alert.informativeText = dirty.map(\.filename).joined(separator: "\n")
+            alert.addButton(withTitle: manager.language == .ru ? "Отмена" : "Cancel"); alert.addButton(withTitle: manager.language == .ru ? "Выйти без сохранения" : "Quit without saving")
+            guard let window = NSApp.keyWindow ?? workspace,window.attachedSheet == nil else { return .terminateCancel }
+            alert.beginSheetModal(for: window) { response in sender.reply(toApplicationShouldTerminate: response == .alertSecondButtonReturn) }
+            return .terminateLater
+        }
         guard !updater.installing else { return .terminateCancel }
-        let owners = [manager] + PDFWindowPool.shared.allManagers
+        let owners = [manager] + (manager.splitManager.map { [$0] } ?? []) + PDFWindowPool.shared.allManagers
         guard owners.allSatisfy({ $0.loadingFiles == 0 && $0.operationTask == nil && $0.finishSourceEditing?() != false }) else {
             manager.say("Finish or cancel document operations before installing an update.","Завершите или отмените операции с документами перед установкой обновления.")
             return .terminateCancel
@@ -1033,7 +1293,7 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
     }
 
     private struct RecoveredPDF: Codable {
-        var file: String; var original: URL; var name: String?; var untitled: Bool; var page: Int; var zoom: CGFloat
+        var file: String; var original: URL; var name: String?; var source: UUID?; var untitled: Bool; var page: Int; var zoom: CGFloat
     }
     private var recoveryRoot: URL {
         FileManager.default.urls(for: .applicationSupportDirectory,in: .userDomainMask)[0].appendingPathComponent("BotPlusUpdateRecovery",isDirectory: true)
@@ -1050,7 +1310,7 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
             let name = UUID().uuidString+".pdf"
             try owner.serializedData(item).write(to: batch.appendingPathComponent(name),options: .atomic)
             try fm.setAttributes([.posixPermissions: 0o600],ofItemAtPath: batch.appendingPathComponent(name).path)
-            records.append(.init(file: name,original: item.url,name: item.filename,untitled: item.isUntitled,page: item.pageIndex,zoom: item.zoom))
+            records.append(.init(file: name,original: item.url,name: item.filename,source: item.store.id,untitled: item.isUntitled,page: item.pageIndex,zoom: item.zoom))
         } }
         try JSONEncoder().encode(records).write(to: batch.appendingPathComponent("documents.json"),options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600],ofItemAtPath: batch.appendingPathComponent("documents.json").path)
@@ -1065,12 +1325,19 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
             let records = try JSONDecoder().decode([RecoveredPDF].self,from: Data(contentsOf: batch.appendingPathComponent("documents.json")))
             guard records.count <= 1000 else { return }
             var recovered: [PDFDocumentItem] = []
+            var shared: [UUID:SharedPDFDocument] = [:]
             for record in records {
                 guard record.file.range(of: "^[A-Fa-f0-9-]{36}\\.pdf$",options: .regularExpression) != nil,
                       let document = PDFDocument(url: batch.appendingPathComponent(record.file)) else { throw PDFSourceError.document }
                 AnnotationMetadata.restore(document)
                 // Recovery becomes an untitled copy: saving cannot overwrite an original silently.
-                let item = PDFDocumentItem(url: record.original,document: document)
+                let item: PDFDocumentItem
+                if let id = record.source,let store = shared[id] { item = PDFDocumentItem(shared: store,page: record.page,zoom: record.zoom) }
+                else {
+                    item = PDFDocumentItem(url: record.original,document: document,preserveStreams: true)
+                    item.rootSourceData = try Data(contentsOf: batch.appendingPathComponent(record.file))
+                    if let id = record.source { shared[id] = item.store }
+                }
                 item.isUntitled = true; item.recoveredFilename = record.name ?? record.original.lastPathComponent; item.pageIndex = min(max(0,record.page),max(0,document.pageCount-1)); item.zoom = record.zoom.isFinite ? record.zoom : 1
                 recovered.append(item)
             }
@@ -1124,6 +1391,7 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
         let app = menu(BotPlusBrand.name)
         command(app, "About BotPlus PDF Editor", "О программе BotPlus PDF Editor", "", .about)
         command(app, "Settings…", "Настройки…", ",", .settings)
+        command(app, "Customize Ribbon…", "Настроить ленту…", "", .feature("customize"))
         command(app, "Updates…", "Обновления…", "", .feature("updates"))
         app.addItem(.separator())
         let services = NSMenu(title: text("Services", "Службы"))
@@ -1152,6 +1420,8 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
         command(edit, "Copy", "Копировать", "c", .copy)
         command(edit, "Paste", "Вставить", "v", .paste)
         responder(edit, "Select All", "Выделить всё", "a", #selector(NSText.selectAll(_:)))
+        edit.addItem(.separator())
+        command(edit, "Find in PDF…", "Найти в PDF…", "f", .feature("search"))
         let window = menu(text("Window", "Окно"))
         responder(window, "Minimize", "Свернуть", "m", #selector(NSWindow.performMiniaturize(_:)))
         responder(window, "Zoom", "Развернуть", "", #selector(NSWindow.performZoom(_:)))
@@ -1171,6 +1441,14 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
 
     @objc private func runCommand(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? RibbonAction else { return }
+        if let thumbnails = NSApp.keyWindow?.firstResponder as? any PDFThumbnailCommandTarget {
+            switch action {
+            case .copy: thumbnails.performThumbnailCommand("copy"); return
+            case .cut: thumbnails.performThumbnailCommand("cut"); return
+            case .paste: thumbnails.performThumbnailCommand("paste"); return
+            default: break
+            }
+        }
         if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
             switch action {
             case .copy: editor.copy(sender); return
@@ -1189,6 +1467,14 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if AppUpdateController.shared.installing { return false }
         guard let action = item.representedObject as? RibbonAction else { return true }
+        if let thumbnails = NSApp.keyWindow?.firstResponder as? any PDFThumbnailCommandTarget {
+            switch action {
+            case .copy: return thumbnails.canPerformThumbnailCommand("copy")
+            case .cut: return thumbnails.canPerformThumbnailCommand("cut")
+            case .paste: return thumbnails.canPerformThumbnailCommand("paste")
+            default: break
+            }
+        }
         if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
             switch action {
             case .copy: return editor.selectedRange().length > 0
@@ -1210,11 +1496,11 @@ private struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            QuickBar(manager: manager)
-            RibbonView(manager: manager)
+            QuickBar(manager: manager.activePane)
+            RibbonView(manager: manager.activePane)
             DocumentTabs(manager: manager)
             WorkspaceArea(manager: manager).onDrop(of: [UTType.fileURL], isTargeted: nil, perform: receivePDFs)
-            StatusBar(manager: manager)
+            StatusBar(manager: manager.activePane)
         }
         .overlay(alignment: .bottomTrailing) {
             if let progress = manager.operationProgress {
@@ -1244,25 +1530,7 @@ private struct ContentView: View {
             DispatchQueue.main.async { (NSApp.delegate as? BotPlusAppDelegate)?.rebuildMenus() }
         }
         .onChange(of: manager.theme) { _, _ in manager.panels.synchronizeFloatingWindows(manager: manager) }
-        .sheet(item: $manager.pageWorkflowRequest, onDismiss: { let action = manager.afterPageWorkflowDismiss; manager.afterPageWorkflowDismiss = nil; DispatchQueue.main.async { action?() } }) { PDFPageWorkflowEditor(request: $0) }
-        .sheet(item: $manager.graphicMarkRequest) { PDFGraphicMarkEditor(request: $0) }
-        .sheet(item: $manager.formattingRequest) { PDFFormattingEditor(request: $0) }
-        .sheet(isPresented: $manager.isAboutPresented) { AboutDialog(manager: manager) }
-        .sheet(isPresented: $manager.isLicensePresented) { LicenseDialog(manager: manager) }
-        .sheet(isPresented: $manager.isUpdatePresented) { UpdateDialog(manager: manager) }
-        .sheet(isPresented: $manager.isSpacingPresented) {
-            VStack(alignment: .leading,spacing: 20) {
-                Text(manager.language == .ru ? "Расстояние между страницами" : "Page spacing").font(.title2)
-                HStack { Slider(value: $manager.pageGap,in: 0...40,step: 1); Text("\(Int(manager.pageGap)) pt").monospacedDigit().frame(width: 55) }
-                Text(manager.language == .ru ? "Сохраняется для новых окон. Масштаб PDF и размеры страниц не изменяются." : "Saved for new windows. PDF zoom and page sizes stay unchanged.").font(.caption)
-                HStack { Button(manager.language == .ru ? "Сбросить" : "Reset") { manager.pageGap = 4 }; Spacer(); Button(manager.language == .ru ? "Готово" : "Done") { manager.isSpacingPresented = false } }
-            }.padding(24).frame(width: 450).preferredColorScheme(manager.theme.colorScheme)
-        }
-        .alert(manager.language == .ru ? "Сообщение" : "Notice", isPresented: Binding(
-            get: { manager.notice != nil }, set: { if !$0 { manager.notice = nil } }
-        )) {
-            Button(manager.language == .ru ? "OK" : "OK", role: .cancel) { manager.notice = nil }
-        } message: { Text(manager.notice ?? "") }
+        .modifier(WorkspaceSheets(manager: manager))
     }
 
     private func receivePDFs(_ providers: [NSItemProvider]) -> Bool {
@@ -1365,7 +1633,7 @@ private struct QuickBar: View {
                 Spacer(minLength: 8)
                 HStack(spacing: 6) {
                     SystemSymbolImage(name: "magnifyingglass").foregroundStyle(Palette.muted)
-                    TextField(manager.language == .ru ? "Поиск / Быстрый поиск…" : "Search / Quick Search…", text: $manager.searchText, onCommit: { manager.searchRequestID &+= 1; manager.refreshPresentation() })
+                    TextField(manager.language == .ru ? "Поиск / Быстрый поиск…" : "Search / Quick Search…", text: $manager.searchText, onCommit: { manager.runSearch() })
                         .textFieldStyle(.plain).frame(width: 158).disabled(manager.selected == nil)
                 }.padding(.horizontal, 8).frame(height: 25).background(Palette.raised, in: RoundedRectangle(cornerRadius: 4)).padding(.trailing, 10)
             }
@@ -1440,6 +1708,7 @@ private struct FloppyDiskSymbol: Shape {
 
 private struct RibbonView: View {
     @ObservedObject var manager: DocumentManager
+    @ObservedObject private var profile = RibbonProfile.shared
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1458,11 +1727,22 @@ private struct RibbonView: View {
             Palette.separator.frame(height: 1)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 0) {
-                    ForEach(Self.groups(for: manager.tab), id: \.id) { group in RibbonGroupView(group: group, manager: manager) }
+                    ForEach(displayGroups, id: \.id) { group in RibbonGroupView(group: group, manager: manager) }
                 }.padding(.horizontal, 6)
             }.frame(height: 91)
             Palette.separator.frame(height: 1)
         }.background(Palette.ribbon)
+    }
+
+    private var displayGroups: [RibbonGroupSpec] {
+        let all = Self.groups(for: manager.tab), key = String(describing: manager.tab)
+        return profile.ordered(all.map(\.id),scope: key).compactMap { id in
+            guard let group = all.first(where: { $0.id == id }), profile.visible(key+"/"+id) else { return nil }
+            let commands = profile.ordered(group.commands.map(\.id),scope: key+"/"+id).compactMap { commandID in
+                group.commands.first { $0.id == commandID && profile.visible(key+"/"+id+"/"+commandID) }
+            }
+            return commands.isEmpty ? nil : RibbonGroupSpec(group.id,group.title.en,group.title.ru,commands)
+        }
     }
 
     private func tabWidth(_ tab: RibbonTab) -> CGFloat {
@@ -1505,9 +1785,9 @@ private struct RibbonView: View {
                 RibbonGroupSpec("note", "Note", "Заметка", [cmd("note", "Sticky Note", "Заметка", "note.text")]),
                 RibbonGroupSpec("markup", "Text Markup", "Разметка текста", [RibbonCommand("highlight", "Highlight", "Подсветка", "highlighter", .highlight), cmd("strike", "Strikethrough", "Зачёркивание", "strikethrough"), RibbonCommand("underline", "Underline", "Подчёркивание", "underline", .underline)]),
                 RibbonGroupSpec("drawing", "Drawing", "Рисование", [tool("line", "Line", "Линия", "line.diagonal", .line), tool("arrow", "Arrow", "Стрелка", "arrow.up.right", .arrow), tool("rect", "Rectangle", "Прямоугольник", "rectangle", .rectangle), tool("ellipse", "Ellipse", "Эллипс", "oval", .ellipse), cmd("cloud", "Cloud", "Облако", "cloud"), cmd("pencil", "Pencil", "Карандаш", "pencil.tip"), cmd("eraser", "Eraser", "Ластик", "eraser")]),
-                RibbonGroupSpec("measure", "Measurement", "Измерение", [cmd("distance", "Distance", "Расстояние", "ruler"), cmd("perimeter", "Perimeter", "Периметр", "point.topleft.down.to.point.bottomright.curvepath"), cmd("area", "Area", "Площадь", "square.dashed"), cmd("scale", "Scale: 1:1", "Масштаб: 1:1", "scale.3d")]),
+                RibbonGroupSpec("measure", "Measurement", "Измерение", [cmd("distance", "Distance", "Расстояние", "ruler"), cmd("perimeter", "Perimeter", "Периметр", "point.topleft.down.to.point.bottomright.curvepath"), cmd("area", "Area", "Площадь", "square.dashed"), cmd("scale", "Calibrate Scale", "Калибровать масштаб", "scale.3d"), cmd("measurementScale", "Measurement Scale", "Масштаб измерений", "slider.horizontal.3")]),
                 RibbonGroupSpec("media", "Media", "Медиа", [cmd("audio", "Audio", "Аудио", "waveform"), cmd("video", "Video", "Видео", "video"), cmd("3d", "3D", "3D", "cube")]),
-                RibbonGroupSpec("manage", "Comment Management", "Управление комментариями", [cmd("list", "Comments List", "Список комментариев", "list.bullet"), cmd("importComments", "Import", "Импорт", "square.and.arrow.down"), cmd("exportComments", "Export", "Экспорт", "square.and.arrow.up")])
+                RibbonGroupSpec("manage", "Comment Management", "Управление комментариями", [cmd("list", "Comments List", "Список комментариев", "list.bullet"), cmd("selectAllAnnotations", "Select on Page", "Выделить на странице", "square.dashed"), cmd("importComments", "Import", "Импорт", "square.and.arrow.down"), cmd("exportComments", "Export PDF", "Экспорт PDF", "square.and.arrow.up"), cmd("importCommentsXFDF", "Import XFDF", "Импорт XFDF", "arrow.down.doc"), cmd("exportCommentsXFDF", "Export XFDF", "Экспорт XFDF", "arrow.up.doc"), cmd("importCommentsFDF", "Import FDF", "Импорт FDF", "arrow.down.doc"), cmd("exportCommentsFDF", "Export FDF", "Экспорт FDF", "arrow.up.doc")])
             ]
         case .protect:
             return [RibbonGroupSpec("signatures", "Digital Signatures", "Цифровые подписи", [cmd("sign", "Sign Document", "Подписать документ", "signature"), cmd("verify", "Verify", "Проверить", "checkmark.seal")]),
@@ -1518,8 +1798,8 @@ private struct RibbonView: View {
                     RibbonGroupSpec("docusign", "DocuSign", "DocuSign", [cmd("docusign", "Send for Signature", "Отправить на подпись", "paperplane")])]
         case .form:
             return [RibbonGroupSpec("fields", "Form Fields", "Поля формы", [cmd("textField", "Text Field", "Текстовое поле", "character.textbox"), cmd("checkbox", "Checkbox", "Флажок", "checkmark.square"), cmd("radio", "Radio Button", "Переключатель", "circle.inset.filled"), cmd("dropdown", "Dropdown", "Список", "chevron.down.square"), cmd("button", "Button", "Кнопка", "button.horizontal")]),
-                    RibbonGroupSpec("field", "Fields", "Поля", [cmd("selectFields", "Select Fields", "Выбрать поля", "cursorarrow"), cmd("alignFields", "Align", "Выровнять", "align.horizontal.left")]),
-                    RibbonGroupSpec("data", "Form Data", "Данные формы", [cmd("import", "Import", "Импорт", "square.and.arrow.down"), cmd("export", "Export", "Экспорт", "square.and.arrow.up"), cmd("clear", "Clear", "Очистить", "eraser")]),
+                    RibbonGroupSpec("field", "Fields", "Поля", [cmd("selectFields", "Select Fields", "Выбрать поля", "cursorarrow"), cmd("alignFields", "Align", "Выровнять", "align.horizontal.left"), cmd("formOrder", "Tab Order", "Порядок Tab", "list.number"), cmd("tabTraversal", "Tab Rule", "Правило Tab", "arrow.right.to.line"), cmd("validateForm", "Validate Form", "Проверить форму", "checkmark.seal")]),
+                    RibbonGroupSpec("data", "Form Data", "Данные формы", [cmd("import", "Import", "Импорт", "square.and.arrow.down"), cmd("export", "Export", "Экспорт", "square.and.arrow.up"), cmd("clear", "Clear", "Очистить", "eraser"), cmd("importXFDF", "Import XFDF", "Импорт XFDF", "arrow.down.doc"), cmd("exportXFDF", "Export XFDF", "Экспорт XFDF", "arrow.up.doc"), cmd("importFDF", "Import FDF", "Импорт FDF", "arrow.down.doc"), cmd("exportFDF", "Export FDF", "Экспорт FDF", "arrow.up.doc")]),
                     RibbonGroupSpec("fill", "Fill Forms", "Заполнение форм", [cmd("fill", "Fill Form", "Заполнить форму", "pencil.line")]),
                     RibbonGroupSpec("javascript", "JavaScript Console", "Консоль JavaScript", [cmd("js", "JavaScript", "JavaScript", "curlybraces")])]
         case .organize:
@@ -1547,7 +1827,7 @@ private struct RibbonView: View {
         case .bookmarks:
             return [RibbonGroupSpec("create", "Create", "Создать", [cmd("bookmarkAdd", "Add Bookmark", "Добавить закладку", "botplus.bookmark.plus"), cmd("bookmarkDelete", "Delete Bookmark", "Удалить закладку", "bookmark.slash"), cmd("bookmarkFromPageText", "From Page Text", "Из текста на странице", "text.viewfinder"), cmd("bookmarkEveryN", "Every N-th Page", "Закладка для каждой N-й стр.", "book.pages"), cmd("bookmarkFromTOC", "From TOC", "Из Содержания", "list.bullet.rectangle"), cmd("bookmarkFromFile", "From Text File", "Из текстового файла", "doc.text")]),
                     RibbonGroupSpec("modify", "Modify", "Изменить", [cmd("bookmarkAddText", "Add Text", "Добавить текст", "text.badge.plus"), cmd("bookmarkCase", "Change Case", "Изменить регистр", "textformat"), cmd("bookmarkZoom", "Change Zoom", "Изменить масштаб", "magnifyingglass"), cmd("bookmarkDestination", "Named Destination to Link", "Имен. назначение в ссылку", "link"), cmd("bookmarkFind", "Find & Replace", "Найти и заменить", "text.magnifyingglass"), cmd("bookmarkActions", "Delete Actions", "Удалить действия", "trash"), cmd("bookmarkSort", "Sort", "Сортировать", "arrow.up.arrow.down"), cmd("bookmarkValidate", "Validate", "Утвердить", "checkmark.seal"), cmd("bookmarkMerge", "Merge Duplicates", "Объединить дубликаты", "arrow.triangle.merge")]),
-                    RibbonGroupSpec("convert", "Convert", "Преобразовать", [cmd("bookmarkTOC", "Create Table of Contents", "Создать Содержание", "list.bullet.indent"), cmd("bookmarkLinks", "Link for Bookmarks", "Ссылка для закладок", "link.badge.plus"), cmd("bookmarkSortPages", "Sort Pages", "Сортировка страниц", "doc.text.magnifyingglass"), cmd("bookmarkNamed", "Convert to Named Destinations", "Преобр. в им. назначения", "bookmark.fill"), cmd("bookmarkHTML", "Export to HTML", "Экспорт в HTML", "chevron.left.forwardslash.chevron.right"), cmd("bookmarkText", "Export to Text File", "Экспортировать в текстовый файл", "doc.text")])]
+                    RibbonGroupSpec("convert", "Convert", "Преобразовать", [cmd("bookmarkTOC", "Create Table of Contents", "Создать Содержание", "list.bullet.indent"), cmd("bookmarkLinks", "Link for Bookmarks", "Ссылка для закладок", "link.badge.plus"), cmd("bookmarkSortPages", "Sort Pages", "Сортировка страниц", "doc.text.magnifyingglass"), cmd("namedDestinations", "Named Destinations", "Именованные назначения", "list.bullet.rectangle"), cmd("bookmarkNamed", "Convert to Named Destinations", "Преобр. в им. назначения", "bookmark.fill"), cmd("bookmarkJSON", "Export Tree JSON", "Экспорт дерева JSON", "curlybraces"), cmd("bookmarkHTML", "Export to HTML", "Экспорт в HTML", "chevron.left.forwardslash.chevron.right"), cmd("bookmarkText", "Export to Text File", "Экспортировать в текстовый файл", "doc.text")])]
         case .help:
             return [RibbonGroupSpec("ui", "UI Settings", "Настройки интерфейса", [RibbonCommand("theme", "Theme", "Тема", "circle.lefthalf.filled", .themePicker), cmd("customize", "Customize Ribbon", "Настроить ленту", "slider.horizontal.3"), RibbonCommand("language", "Language", "Язык", "globe", .languagePicker)]),
                     RibbonGroupSpec("help", "Contact", "Контакты", [RibbonCommand("support", "Support", "Поддержка", "person.crop.circle.badge.questionmark", .support), RibbonCommand("telegram", "Telegram", "Телеграм", "paperplane", .telegram)]),
@@ -1574,6 +1854,14 @@ private struct RibbonGroupView: View {
                         case .panels: PanelsMenuButton(manager: manager, command: command)
                         case .languagePicker: LanguageMenuButton(manager: manager, command: command)
                         case .themePicker: ThemeMenuButton(manager: manager, command: command)
+                        case .tool(.snapshot):
+                            Menu {
+                                Button(manager.language == .ru ? "Выделить область" : "Select region") { manager.perform(.tool(.snapshot)) }
+                                Button(manager.language == .ru ? "Изменить область…" : "Edit region…") { manager.send(.feature("snapshotRegion")) }.disabled(manager.snapshotSource?.id != manager.selectedID)
+                                Button(manager.language == .ru ? "Повторить снимок" : "Capture again") { manager.send(.feature("snapshotAgain")) }.disabled(manager.snapshotSource?.id != manager.selectedID)
+                                Button(manager.language == .ru ? "Снимок выбранного объекта" : "Capture selected object") { manager.send(.feature("snapshotObject")) }.disabled(manager.selectedAnnotation == nil && manager.selectedContent == nil)
+                                Button(manager.language == .ru ? "Печать снимка" : "Print snapshot") { manager.send(.feature("snapshotPrint")) }.disabled(manager.snapshotPNG == nil)
+                            } label: { commandLabel(command,manager: manager) }.menuStyle(.borderlessButton)
                         default:
                             Button { manager.perform(command.action) } label: {
                                 commandLabel(command, manager: manager)
@@ -1663,25 +1951,46 @@ private struct DocumentTabs: View {
     @ObservedObject var manager: DocumentManager
     var body: some View {
         HStack(spacing: 0) {
-            ForEach(manager.documents) { item in
+            ScrollView(.horizontal,showsIndicators: false) {
                 HStack(spacing: 0) {
-                    Button { manager.select(item.id) } label: {
-                        HStack(spacing: 7) {
-                            SystemSymbolImage(name: "doc.text").foregroundStyle(manager.selectedID == item.id ? Palette.accent : Palette.muted)
-                            Text(item.filename).lineLimit(1)
-                        }.font(.system(size: 11)).padding(.horizontal, 11).frame(height: 32).frame(maxWidth: 230)
-                            .background(manager.selectedID == item.id ? Palette.selected : .clear)
-                    }.buttonStyle(.plain).help(item.filename)
-                    Button { manager.close(item.id) } label: { SystemSymbolImage(name: "xmark").font(.system(size: 9, weight: .semibold)).frame(width: 24, height: 28) }
-                        .buttonStyle(.plain).help(manager.language == .ru ? "Закрыть документ" : "Close document")
-                }.overlay(alignment: .trailing) { Palette.separator.frame(width: 1, height: 18) }
+                    ForEach(manager.documents) { item in tab(item) }
+                    Button { manager.openPanel() } label: { Image(systemName: "plus").frame(width: 35,height: 32) }.buttonStyle(.plain)
+                }
             }
-            Button { manager.openPanel() } label: { SystemSymbolImage(name: "plus").font(.system(size: 11, weight: .semibold)).frame(width: 35, height: 32) }
-                .buttonStyle(.plain).help(manager.language == .ru ? "Открыть PDF" : "Open PDF")
-            Spacer()
+        }.frame(height: 33).background(Palette.ribbon).overlay(alignment: .bottom) { Palette.separator.frame(height: 1) }
+    }
+    private func tab(_ item: PDFDocumentItem) -> some View {
+        HStack(spacing: 0) {
+            Button { manager.select(item.id) } label: {
+                HStack(spacing: 6) { Image(systemName: "doc.text"); Text(item.filename).lineLimit(1); if item.isUntitled || item.store.revision != item.store.savedRevision { Circle().fill(Palette.accent).frame(width: 5,height: 5) } }
+                    .font(.system(size: 11)).padding(.horizontal,10).frame(width: 210,height: 32)
+            }.buttonStyle(.plain)
+            Button { manager.closeTabs([item.id]) } label: { Image(systemName: "xmark").font(.system(size: 9)).frame(width: 24,height: 28) }.buttonStyle(.plain)
+        }.background(manager.selectedID == item.id ? Palette.selected : .clear)
+        .help(item.url.path)
+        .onDrag { NSItemProvider(item: Data(item.id.uuidString.utf8) as NSData,typeIdentifier: "com.botplus.pdf.tab-drag") }
+        .onDrop(of: ["com.botplus.pdf.tab-drag"],isTargeted: nil) { providers in
+            guard let provider = providers.first else { return false }
+            provider.loadDataRepresentation(forTypeIdentifier: "com.botplus.pdf.tab-drag") { data,_ in
+                guard let data,let value = String(data: data,encoding: .utf8),let id = UUID(uuidString: value) else { return }
+                Task { @MainActor in manager.moveTab(id,before: item.id) }
+            }; return true
         }
-        .frame(height: 33).background(Palette.ribbon.opacity(0.96))
-        .overlay(alignment: .bottom) { Palette.separator.frame(height: 1) }
+        .contextMenu {
+            Button(manager.language == .ru ? "Дублировать вид" : "Duplicate view") { manager.duplicateView(item.id) }
+            Button(manager.language == .ru ? "Открепить в новое окно" : "Move to new window") { manager.detachTab(item.id) }
+            Button(manager.language == .ru ? "Второй вид в новом окне" : "Duplicate in new window") { manager.duplicateView(item.id,detached: true) }
+            Button(manager.language == .ru ? "Разделить по вертикали" : "Split side by side") { manager.splitView(item.id,horizontal: true) }
+            Button(manager.language == .ru ? "Разделить по горизонтали" : "Split top and bottom") { manager.splitView(item.id,horizontal: false) }
+            Divider()
+            Button(manager.language == .ru ? "Показать в Finder" : "Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }.disabled(item.isUntitled)
+            Button(manager.language == .ru ? "Копировать путь" : "Copy path") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(item.url.path,forType: .string) }
+            Button(manager.language == .ru ? "Свойства документа" : "Document properties") { manager.select(item.id); manager.panels.select(.properties) }
+            Divider()
+            Button(manager.language == .ru ? "Закрыть другие" : "Close others") { manager.closeTabs(manager.documents.filter { $0.id != item.id }.map(\.id)) }
+            Button(manager.language == .ru ? "Закрыть справа" : "Close tabs to right") { if let index = manager.documents.firstIndex(where: { $0.id == item.id }) { manager.closeTabs(Array(manager.documents.dropFirst(index+1)).map(\.id)) } }
+            Button(manager.language == .ru ? "Закрыть всё" : "Close all") { manager.closeTabs(manager.documents.map(\.id)) }
+        }
     }
 }
 
@@ -1722,7 +2031,28 @@ private struct WorkspaceArea: View {
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
-    private var viewer: some View {
+    @ViewBuilder private var viewer: some View {
+        if let second = manager.splitManager {
+            if manager.splitHorizontal {
+                HSplitView { PDFViewportPane(manager: manager); SecondaryPDFPane(manager: second,owner: manager) }
+            } else { VSplitView { PDFViewportPane(manager: manager); SecondaryPDFPane(manager: second,owner: manager) } }
+        } else { PDFViewportPane(manager: manager) }
+    }
+}
+private struct SecondaryPDFPane: View {
+    @ObservedObject var manager: DocumentManager
+    @ObservedObject var owner: DocumentManager
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack { Text(manager.title).font(.caption).lineLimit(1); Spacer(); Button { owner.closeSplit() } label: { Image(systemName: "xmark") } }.padding(6)
+            DocumentTabs(manager: manager)
+            PDFViewportPane(manager: manager)
+        }.frame(minWidth: 180,minHeight: 180).modifier(WorkspaceSheets(manager: manager))
+    }
+}
+private struct PDFViewportPane: View {
+    @ObservedObject var manager: DocumentManager
+    var body: some View {
         VStack(spacing: 0) {
             if manager.rulersVisible {
                 HStack(spacing: 0) {
@@ -1777,7 +2107,7 @@ private struct DockedPanelContainer: View {
                 if side == .right { PanelResizeHandle(panel: panel, manager: manager, direction: -1, initialWidth: width).frame(width: 6) }
                 VStack(spacing: 0) {
                     PanelHeader(panel: panel, manager: manager)
-                    PanelBody(panel: panel, manager: manager)
+                    ActivePanelBody(panel: panel, manager: manager)
                 }.frame(width: width).frame(maxHeight: .infinity).background(Palette.panel)
                 if side == .left { PanelResizeHandle(panel: panel, manager: manager, direction: 1, initialWidth: width).frame(width: 6) }
             }
@@ -1863,18 +2193,65 @@ private struct PanelBody: View {
     let panel: WorkspacePanel
     @ObservedObject var manager: DocumentManager
     @ObservedObject private var panels: PanelWorkspaceModel
+    @AppStorage("BotPlus.thumbnailLogicalLabels") private var thumbnailLogicalLabels = true
     init(panel: WorkspacePanel, manager: DocumentManager) { self.panel = panel; self.manager = manager; self.panels = manager.panels }
     var body: some View {
         Group {
             switch panel {
             case .thumbnails: thumbnailList
             case .bookmarks: bookmarkList
+            case .search: searchList
             case .properties: properties
             case .comments: comments
-            case .layers: empty(manager.language == .ru ? "Слои PDF недоступны" : "No PDF layers available", symbol: "square.3.layers.3d")
-            case .attachments: empty(manager.language == .ru ? "Вложения не найдены" : "No attachments found", symbol: "paperclip")
+            case .layers: layerList
+            case .attachments: attachmentList
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var searchList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField(manager.language == .ru ? "Текст в PDF" : "Text in PDF", text: $manager.searchText)
+                    .onSubmit { manager.runSearch() }
+                Button { manager.runSearch() } label: { SystemSymbolImage(name: "magnifyingglass") }
+                    .help(manager.language == .ru ? "Найти" : "Find")
+            }.disabled(manager.selected == nil)
+            HStack {
+                if manager.searchRunning { ProgressView().controlSize(.small) }
+                Text(manager.language == .ru ? "Совпадений: \(manager.searchMatches.count)" : "Matches: \(manager.searchMatches.count)")
+                    .font(.caption).foregroundStyle(Palette.muted)
+                Spacer()
+                Button { manager.stepSearch(-1) } label: { SystemSymbolImage(name: "chevron.up") }
+                    .help(manager.language == .ru ? "Предыдущее совпадение" : "Previous match")
+                Button { manager.stepSearch(1) } label: { SystemSymbolImage(name: "chevron.down") }
+                    .help(manager.language == .ru ? "Следующее совпадение" : "Next match")
+                Button { manager.clearSearch() } label: { SystemSymbolImage(name: "xmark") }
+                    .help(manager.language == .ru ? "Очистить результаты" : "Clear results")
+            }.buttonStyle(.plain)
+            if manager.searchMatches.isEmpty {
+                Text(manager.language == .ru
+                     ? (manager.searchCompleted ? "Совпадений нет. Для сканов сначала выполните OCR." : "Введите текст и нажмите Enter.")
+                     : (manager.searchCompleted ? "No matches. Run OCR first for scans." : "Enter text and press Return."))
+                    .font(.caption).foregroundStyle(Palette.muted).padding(.top, 8)
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(manager.searchMatches) { match in
+                            Button { manager.selectSearchMatch(match.id) } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(manager.language == .ru ? "\(match.id + 1). Страница \(match.page + 1)" : "\(match.id + 1). Page \(match.page + 1)")
+                                        .font(.system(size: 11, weight: .semibold))
+                                    Text(match.snippet).font(.system(size: 12)).lineLimit(4)
+                                }.frame(maxWidth: .infinity, alignment: .leading).padding(7)
+                                    .background(manager.searchMatchID == match.id ? Color.accentColor.opacity(0.22) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                            }.buttonStyle(.plain).id(match.id)
+                        }
+                    }
+                }.onChange(of: manager.searchMatchID) { _, id in if let id { proxy.scrollTo(id, anchor: .center) } }
+            }
+        }.padding(10)
     }
 
     @ViewBuilder private var thumbnailList: some View {
@@ -1891,47 +2268,81 @@ private struct PanelBody: View {
                         Spacer()
                         Button { manager.thumbnailZoom = min(1, manager.thumbnailZoom+0.1) } label: { SystemSymbolImage(name: "plus.magnifyingglass") }
                             .disabled(manager.thumbnailZoom >= 1)
+                        Menu {
+                            Toggle(manager.language == .ru ? "Номера страниц из PDF" : "PDF page labels", isOn: $thumbnailLogicalLabels)
+                        } label: { SystemSymbolImage(name: "number") }
+                            .menuStyle(.borderlessButton).fixedSize()
+                            .help(manager.language == .ru ? "Нумерация миниатюр" : "Thumbnail numbering")
                     }.buttonStyle(.plain).padding(.horizontal,10).help(manager.language == .ru ? "Размер миниатюр" : "Thumbnail size")
-                    GeometryReader { geometry in
-                        let available = max(44,geometry.size.width-16)
-                        let target = 44+(available-44)*CGFloat(manager.thumbnailZoom)
-                        let count = max(1,Int((available+8)/(target+8)))
-                        let cell = (available-CGFloat(count-1)*8)/CGFloat(count)
-                        ScrollView {
-                            LazyVGrid(columns: Array(repeating: GridItem(.flexible(),spacing: 8),count: count),spacing: 10) {
-                                ForEach(0..<document.pageCount,id: \.self) { index in
-                                    if let page = document.page(at: index) {
-                                        let box = page.bounds(for: .cropBox),rotated = page.rotation%180 != 0
-                                        let ratio = rotated ? box.width/max(1,box.height) : box.height/max(1,box.width)
-                                        Button { manager.navigate(to: index) } label: {
-                                            VStack(spacing: 4) {
-                                                Image(nsImage: PDFThumbnailCache.shared.image(page: page,documentID: item.id,index: index,revision: manager.contentRevision,width: cell,ratio: ratio,interactive: manager.thumbnailGestureActive || panels.isResizing))
-                                                    .resizable().aspectRatio(contentMode: .fit).frame(width: cell,height: cell*ratio)
-                                                    .background(.white)
-                                                    .overlay(Rectangle().stroke(manager.selected?.pageIndex == index ? Palette.accent : Palette.separator,lineWidth: 2))
-                                                Text("\(index+1)").font(.system(size: 10)).foregroundStyle(Palette.muted)
-                                            }
-                                        }.buttonStyle(.plain)
-                            .contextMenu {
-                                Button(manager.language == .ru ? "Удалить страницу" : "Delete page") { manager.send(.deletePageAt(index)) }.disabled(document.pageCount <= 1)
-                                Button(manager.language == .ru ? "Дублировать страницу" : "Duplicate page") { manager.send(.duplicatePageAt(index)) }
-                                Divider()
-                                Button(manager.language == .ru ? "Копировать страницу" : "Copy page") { manager.send(.copyPageAt(index)) }
-                                Button(manager.language == .ru ? "Вставить страницы после" : "Paste pages after") { manager.send(.pastePagesAt(index+1)) }
-                                Button(manager.language == .ru ? "Вставить пустую перед" : "Insert blank before") { manager.send(.blankPageAt(index)) }
-                                Button(manager.language == .ru ? "Вставить пустую после" : "Insert blank after") { manager.send(.blankPageAt(index+1)) }
-                                Divider()
-                                Button(manager.language == .ru ? "Повернуть по часовой стрелке" : "Rotate clockwise") { manager.send(.rotatePageAt(index,90)) }
-                                Button(manager.language == .ru ? "Повернуть против часовой стрелки" : "Rotate counterclockwise") { manager.send(.rotatePageAt(index,-90)) }
-                            }
-                                    }
-                                }
-                            }.padding(8)
-                        }
-                    }
+                    PDFThumbnailGrid(documentID: item.id, revision: item.store.revision,
+                        pageCount: item.pageCount, currentPage: item.pageIndex, selected: item.selectedPages,
+                        zoom: manager.thumbnailZoom, interactive: manager.thumbnailGestureActive || panels.isResizing,
+                        logicalLabels: thumbnailLogicalLabels, russian: manager.language == .ru,
+                        aspect: { index in thumbnailRatio(document.page(at: index)) },
+                        label: { index in thumbnailLogicalLabels ? (document.page(at: index)?.label ?? String(index + 1)) : String(index + 1) },
+                        image: { index, width in
+                            guard let page = document.page(at: index) else { return NSImage(size: .zero) }
+                            return PDFThumbnailCache.shared.image(page: page, documentID: item.id, index: index,
+                                revision: item.store.revision, width: width, ratio: thumbnailRatio(page),
+                                interactive: manager.thumbnailGestureActive || panels.isResizing)
+                        },
+                        // Native selection may precede SwiftUI publication by one
+                        // event cycle; GridView checks its own current count.
+                        canCommand: { manager.canThumbnailCommand($0, selectionCount: 0) },
+                        command: { action, index in manager.thumbnailCommand(action, index: index) },
+                        selectionChanged: { values, focus in
+                            guard manager.selected?.id == item.id else { return }
+                            item.selectedPages = values.filter { (0..<item.pageCount).contains($0) }
+                            if let focus, (0..<item.pageCount).contains(focus) { item.thumbnailAnchor = focus; manager.navigate(to: focus) }
+                            else { manager.refreshPresentation() }
+                        },
+                        focus: { window in
+                            if let parent = manager.parentManager { parent.splitFocused = true } else { manager.splitFocused = false }
+                            PDFWindowPool.shared.focus(manager, window: window)
+                            manager.refreshPresentation()
+                        },
+                        acceptDrop: { payload, index in receivePageDrop(payload, before: index, item: item) })
                 }.background(ThumbnailGestureRegion(manager: manager))
             } else { empty(manager.language == .ru ? "Откройте PDF" : "Open a PDF",symbol: "doc.text") }
         }
+    }
+
+    private func thumbnailRatio(_ page: PDFPage?) -> CGFloat {
+        guard let page else { return 1.414 }
+        let box = page.bounds(for: .cropBox)
+        let ratio = page.rotation % 180 != 0 ? box.width / max(1, box.height) : box.height / max(1, box.width)
+        return ratio.isFinite ? min(12, max(0.1, ratio)) : 1.414
+    }
+    private func receivePageDrop(_ payload: String, before index: Int, item: PDFDocumentItem) -> Bool {
+        let parts = payload.split(separator: "|")
+        guard parts.count == 3, UUID(uuidString: String(parts[0])) != nil,
+              Int(parts[2]) != nil, manager.selected?.id == item.id else { return false }
+        manager.send(.feature("pages-drop:\(parts[0]):\(parts[1]):\(index):\(parts[2])"))
+        return true
+    }
+
+    private var attachmentList: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Button(manager.language == .ru ? "Добавить…" : "Add…") { manager.send(.feature("attachmentAdd")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                Button { manager.send(.feature("attachmentRefresh")) } label: { Image(systemName: "arrow.clockwise") }.disabled(manager.selected == nil)
+            }.padding(8)
+            if let error = manager.attachmentError { Text(error).font(.caption).foregroundStyle(.orange).padding(8) }
+            if manager.attachments.isEmpty && manager.attachmentError == nil { Text(manager.language == .ru ? "Вложений нет" : "No attachments").font(.caption).padding(8) }
+            List(manager.attachments) { entry in
+                VStack(alignment: .leading) {
+                    Text(entry.name).lineLimit(2)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(entry.size),countStyle: .file)).font(.caption).foregroundStyle(.secondary)
+                }.contentShape(Rectangle()).onTapGesture(count: 2) {
+                    if manager.selected?.document.allowsCopying == true { manager.send(.feature("attachmentOpen:\(entry.index)")) }
+                }.contextMenu {
+                    Button(manager.language == .ru ? "Открыть…" : "Open…") { manager.send(.feature("attachmentOpen:\(entry.index)")) }.disabled(manager.selected?.document.allowsCopying != true)
+                    Button(manager.language == .ru ? "Извлечь…" : "Extract…") { manager.send(.feature("attachmentExtract:\(entry.index)")) }.disabled(manager.selected?.document.allowsCopying != true)
+                    Button(manager.language == .ru ? "Удалить" : "Delete") { manager.send(.feature("attachmentDelete:\(entry.index)")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                }
+            }.listStyle(.plain)
+        }.onAppear { DispatchQueue.main.async { manager.send(.feature("attachmentRefresh")) } }
+        .onChange(of: manager.selectedID) { _,_ in manager.attachments = []; manager.send(.feature("attachmentRefresh")) }
     }
 
     private var bookmarkList: some View {
@@ -1961,6 +2372,63 @@ private struct PanelBody: View {
         }
     }
 
+    private var layerList: some View {
+        VStack(alignment: .leading,spacing: 10) {
+            HStack { Text(manager.language == .ru ? "Слои исходного PDF" : "PDF optional content").font(.headline); Spacer(); Button { manager.send(.feature("layersRefresh")) } label: { Image(systemName: "arrow.clockwise") }.disabled(manager.selected == nil) }
+            if !manager.layerPresets.isEmpty {
+                let current = manager.layerPresets.first { $0.id == -1 }
+                Text((manager.language == .ru ? "Основная: " : "Default: ")+(current?.name.isEmpty == false ? current!.name : (manager.language == .ru ? "Без имени" : "Unnamed"))).font(.caption)
+                Menu(manager.language == .ru ? "Сделать конфигурацию основной…" : "Make configuration default…") {
+                    ForEach(manager.layerPresets.filter { $0.id >= 0 }) { preset in
+                        Button(preset.name.isEmpty ? "#\(preset.id+1)" : preset.name) { manager.send(.feature("layerPreset:\(preset.id)")) }.disabled(!preset.canMakeDefault)
+                    }
+                }.disabled(manager.layerPresets.count < 2 || manager.selected?.document.allowsDocumentChanges != true)
+                Button(manager.language == .ru ? "Управление конфигурациями…" : "Manage configurations…") { manager.send(.feature("manageLayerPresets")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                Button(manager.language == .ru ? "Видимость и Intent конфигураций…" : "Configuration visibility and intent…") { manager.send(.feature("layerStateEditor")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                Button(manager.language == .ru ? "Радиогруппы слоёв…" : "Layer radio groups…") { manager.send(.feature("layerRadioEditor")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                Button(manager.language == .ru ? "Порядок слоёв…" : "Layer order…") { manager.send(.feature("layerOrderEditor")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+                Text(manager.language == .ru ? "Прежняя основная сохраняется в списке. Конфигурации с Intent, отличным от View, нельзя сделать основной." : "Keeps the previous default in the list. Configurations with an intent other than View cannot become the default.").font(.caption2).foregroundStyle(.secondary)
+            }
+            if let error = manager.layerError { Text(error).foregroundStyle(.orange).font(.caption) }
+            else if manager.layerEntries.isEmpty { Text(manager.language == .ru ? "Группы OCG в каталоге не найдены." : "No OCG groups found in the catalog.").font(.caption).foregroundStyle(.secondary) }
+            else { ScrollView { VStack(alignment: .leading,spacing: 8) {
+                if manager.layerOutline.isEmpty { Text(manager.language == .ru ? (manager.layerHasOrder ? "Order не содержит отображаемых групп." : "В конфигурации отсутствует Order.") : (manager.layerHasOrder ? "Order has no groups to display." : "This configuration has no Order entry.")).font(.caption).foregroundStyle(.secondary) }
+                ForEach(manager.layerOutline) { row in
+                    if let id = row.layerID,let entry = manager.layerEntries.first(where: { $0.id == id }) { layerToggle(entry).padding(.leading,CGFloat(min(12,row.depth)*12)) }
+                    else { Text(row.title).font(.headline).padding(.leading,CGFloat(min(12,row.depth)*12)) }
+                }
+                let listed = Set(manager.layerOutline.compactMap(\.layerID)),unlisted = manager.layerEntries.filter { !listed.contains($0.id) }
+                if !unlisted.isEmpty {
+                    DisclosureGroup(manager.language == .ru ? "Группы каталога вне Order (\(unlisted.count))" : "Catalog groups outside Order (\(unlisted.count))") {
+                        ForEach(unlisted) { entry in layerToggle(entry) }
+                    }
+                }
+            } } }
+            Text(manager.language == .ru ? "Изменяется конфигурация видимости OCG в PDF. Условия OCMD и правила View/Print сохраняются; отображение зависит от поддержки слоёв движком просмотра." : "Changes the PDF OCG visibility configuration. OCMD and View/Print rules are retained; rendering depends on the viewer’s layer support.").font(.caption).foregroundStyle(.secondary)
+            Button(manager.language == .ru ? "Условия видимости OCMD…" : "OCMD visibility conditions…") { manager.send(.feature("membershipEditor")) }
+            Button(manager.language == .ru ? "Назначить условие страницам…" : "Assign condition to pages…") { manager.send(.feature("membershipBindingEditor")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+            Button(manager.language == .ru ? "Условия изображений и Form…" : "Image and Form conditions…") { manager.send(.feature("xObjectConditionEditor")) }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+            Spacer(minLength: 0)
+        }.padding(10)
+        .onAppear { DispatchQueue.main.async { manager.send(.feature("layersRefresh")) } }
+        .onChange(of: manager.selectedID) { _,_ in manager.layerEntries = []; manager.layerOutline = []; manager.layerHasOrder = false; manager.layerPresets = []; manager.layerSnapshot = nil; manager.send(.feature("layersRefresh")) }
+    }
+    private func layerToggle(_ entry: PDFLayerInfo) -> some View {
+        VStack(alignment: .leading,spacing: 3) {
+            HStack {
+                Toggle(isOn: Binding(get: { entry.visible },set: { manager.send(.feature("layerToggle:\(entry.id):\($0 ? 1 : 0)")) })) {
+                    Text(entry.name.isEmpty ? "OCG #\(entry.id)" : entry.name)
+                }.disabled(entry.locked)
+                Button { manager.send(.feature("layerPolicy:\(entry.id)")) } label: { Image(systemName: "slider.horizontal.3") }.help(manager.language == .ru ? "Свойства и Usage слоя" : "Layer properties and usage").disabled(entry.locked)
+                Button { manager.send(.feature("layerLock:\(entry.id):\(entry.locked ? 0 : 1)")) } label: { Image(systemName: entry.locked ? "lock.fill" : "lock.open") }
+                    .help(manager.language == .ru ? "Блокировка слоя в основной конфигурации (не защита доступа)" : "Layer lock in the default configuration (not access control)")
+            }.disabled(manager.selected?.document.allowsDocumentChanges != true)
+            if entry.viewState != nil || entry.printState != nil {
+                Text("View: \(entry.viewState.map { $0 ? "ON" : "OFF" } ?? "—") · Print: \(entry.printState.map { $0 ? "ON" : "OFF" } ?? "—")").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var properties: some View { WorkspacePropertiesContent(manager: manager) }
 
     private var comments: some View {
@@ -1968,13 +2436,13 @@ private struct PanelBody: View {
             if let item = manager.selected {
                 let annotations = (0..<item.pageCount).flatMap { index -> [(Int, PDFAnnotation)] in
                     guard let page = item.document.page(at: index) else { return [] }
-                    return page.annotations.filter { !AnnotationMetadata.isContainer($0) }.map { (index, $0) }
+                    return page.annotations.filter { $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }.map { (index, $0) }
                 }
                 if annotations.isEmpty { empty(manager.language == .ru ? "Аннотаций нет" : "No annotations", symbol: "text.bubble") }
                 else {
                     List {
                         ForEach(Array(annotations.enumerated()), id: \.offset) { _, entry in
-                            Button { manager.navigate(to: entry.0) } label: {
+                            Button { manager.send(.feature("annotationSelect:\(entry.0):\(item.document.page(at: entry.0)?.annotations.firstIndex(where: { $0 === entry.1 }) ?? -1)")) } label: {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(entry.1.contents ?? entry.1.type ?? (manager.language == .ru ? "Аннотация" : "Annotation"))
                                     Text("\(manager.language == .ru ? "Страница" : "Page") \(entry.0 + 1)").font(.system(size: 9)).foregroundStyle(Palette.muted)
@@ -2006,12 +2474,42 @@ private struct WorkspacePropertiesContent: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading,spacing: 12) {
+                if let annotation = manager.selectedAnnotation,let measure = AnnotationMetadata.measurement(annotation) {
+                    Text(measure.label(russian: manager.language == .ru)).font(.headline)
+                    if measure.kind == .distance {
+                        Picker(manager.language == .ru ? "Расстояние" : "Distance",selection: Binding(get: { measure.axis },set: { axis in manager.send(.feature("measurementAxis:"+axis.rawValue)) })) {
+                            ForEach(EngineeringDistanceAxis.allCases) { Text($0.title(russian: manager.language == .ru)).tag($0) }
+                        }
+                        if measure.axis == .custom { Button(manager.language == .ru ? "Изменить угол…" : "Change angle…") { manager.send(.feature("measurementAxis:custom")) } }
+                        Text(manager.language == .ru ? "Направления заданы в координатах PDF, независимо от поворота страницы." : "Directions use PDF coordinates, independent of page rotation.").font(.caption)
+                    }
+                    if measure.kind == .perimeter || measure.kind == .area || (measure.kind == .distance && measure.dimensionOffset != nil) {
+                        Button(manager.language == .ru ? "Подпись размера и выноска…" : "Dimension label and leader…") { manager.send(.feature("measurementLabel")) }
+                    }
+                    Button(manager.language == .ru ? "Масштаб и размерные линии…" : "Scale and dimension lines…") { manager.send(.feature("measurementScale")) }
+                    Button(manager.language == .ru ? "Преобразовать измерения…" : "Transform measurements…") { manager.send(.feature("measurementTransform")) }
+                    Button(manager.language == .ru ? "Перенести на страницу…" : "Move to page…") { manager.send(.feature("measurementTransfer")) }.disabled((manager.selected?.pageCount ?? 0) < 2)
+                    Button(manager.language == .ru ? "Копировать в другой PDF…" : "Copy to another PDF…") { manager.send(.feature("measurementCopyDocument")) }.disabled(!manager.documents.contains { $0.document !== manager.selected?.document && $0.document.allowsCommenting })
+                    Picker(manager.language == .ru ? "Единицы измерения" : "Measurement units",selection: Binding(get: { measure.scale.unit },set: { unit in
+                        guard let item = manager.selected else { return }; manager.recordUndo(item,group: "measureUnit")
+                        var value = measure; value.scale.unit = unit; AnnotationMetadata.setMeasurement(value,on: annotation); manager.send(.feature("measureRefresh"))
+                    })) { ForEach(EngineeringUnit.allCases) { Text($0.rawValue).tag($0) } }
+                }
+                if manager.selectedContent?.kind == "group" || (manager.selected != nil && manager.tool == .editContent) {
+                    Button(manager.language == .ru ? "Вложенные Form: независимое преобразование…" : "Nested Forms: independent transform…") { manager.send(.feature("formResourceTransform")) }
+                }
                 if source.active || manager.selectedAnnotation != nil || manager.selectedContent != nil {
                     SourceOrAnnotationProperties(manager: manager)
                 } else if let item = manager.selected {
+                    if [.distance,.perimeter,.area,.calibration].contains(manager.tool) {
+                        Text(manager.language == .ru ? "Щёлкайте вершины. Enter или двойной щелчок — завершить; Esc — отменить." : "Click vertices. Enter or double-click finishes; Esc cancels.").font(.caption)
+                        Toggle(manager.language == .ru ? "Привязка к концам, серединам и пересечениям отрезков" : "Snap to endpoints, midpoints and line intersections",isOn: $manager.engineeringSnap)
+                        Picker(manager.language == .ru ? "Единицы" : "Units",selection: $manager.engineeringUnit) { ForEach(EngineeringUnit.allCases) { Text($0.rawValue).tag($0) } }
+                    }
                     if manager.tool == .snapshot {
                         Toggle(manager.language == .ru ? "Прозрачный фон" : "Transparent background",isOn: $manager.snapshotTransparent)
                         if let image = manager.snapshotImage { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 160) }
+                        Button(manager.language == .ru ? "Изменить область снимка…" : "Edit snapshot region…") { manager.send(.feature("snapshotRegion")) }.disabled(manager.snapshotSource?.id != manager.selectedID)
                         Button(manager.language == .ru ? "Сохранить снимок…" : "Save snapshot…") {
                             guard let png = manager.snapshotPNG else { return }
                             let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = "Snapshot.png"
@@ -2071,7 +2569,33 @@ private struct SourceOrAnnotationProperties: View {
             } else if let annotation = manager.selectedAnnotation {
                 VStack(alignment: .leading,spacing: 8) {
                     Text(manager.language == .ru ? "Свойства комментария" : "Comment properties").font(.headline)
+                    if manager.selectedAnnotationCount > 1 {
+                        Text(manager.language == .ru ? "Выбрано объектов: \(manager.selectedAnnotationCount)" : "Selected annotations: \(manager.selectedAnnotationCount)")
+                        Text(manager.language == .ru ? "Cmd/Shift-клик или рамка — несколько объектов. Стрелки — перенос, Shift — шаг 10 пт. Связанные части выбираются вместе." : "Cmd/Shift-click or drag a rectangle to select multiple objects. Arrow keys move; Shift uses 10 pt. Linked parts are selected together.").font(.caption)
+                        HStack { Button(manager.language == .ru ? "Блокировать все" : "Lock all") { manager.send(.feature("annotationBatchLock:1")) }; Button(manager.language == .ru ? "Разблокировать" : "Unlock all") { manager.send(.feature("annotationBatchLock:0")) } }
+                        HStack { Button(manager.language == .ru ? "Показать все" : "Show all") { manager.send(.feature("annotationBatchVisible:1")) }; Button(manager.language == .ru ? "Скрыть все" : "Hide all") { manager.send(.feature("annotationBatchVisible:0")) } }
+                        HStack { Button(manager.language == .ru ? "Печатать все" : "Print all") { manager.send(.feature("annotationBatchPrint:1")) }; Button(manager.language == .ru ? "Не печатать" : "Do not print") { manager.send(.feature("annotationBatchPrint:0")) } }
+                    }
+                    Button(manager.language == .ru ? "Масштаб выбранной геометрии…" : "Scale selected geometry…") { manager.send(.feature("annotationScale")) }
+                    Button(manager.language == .ru ? "Поворот на заданный угол…" : "Rotate by angle…") { manager.send(.feature("annotationRotate")) }
+                    Menu(manager.language == .ru ? "Отражение в координатах PDF" : "Flip in PDF coordinates") {
+                        Button(manager.language == .ru ? "Слева ↔ справа" : "Left ↔ right") { manager.send(.feature("annotationFlip:horizontal")) }
+                        Button(manager.language == .ru ? "Сверху ↔ снизу" : "Top ↔ bottom") { manager.send(.feature("annotationFlip:vertical")) }
+                    }
+                    HStack {
+                        Button(manager.language == .ru ? "Повернуть влево 90°" : "Rotate left 90°") { manager.send(.feature("annotationRotate:left")) }
+                        Button(manager.language == .ru ? "Вправо 90°" : "Right 90°") { manager.send(.feature("annotationRotate:right")) }
+                    }
+                    Text(manager.language == .ru ? "Поворот: Line, Ink, Square и Circle без измерений. Остальные типы требуют сохранения собственного appearance." : "Rotation supports Line, Ink, Square and Circle without measurements. Other types require their own appearance handling.").font(.caption)
                     Text(annotation.type ?? "Annotation")
+                    if manager.selectedAnnotationCount <= 1 && (["Line","Ink"].contains(annotation.type ?? "") || (AnnotationMetadata.group(of: annotation) != nil && annotation.page?.annotations.contains(where: { $0.type == "Line" && AnnotationMetadata.group(of: $0) == AnnotationMetadata.group(of: annotation) }) == true)) {
+                        Button(manager.language == .ru ? "Редактировать вершины…" : "Edit vertices…") { manager.send(.feature("annotationVertices")) }
+                    }
+                    if manager.selectedAnnotationCount <= 1 {
+                    Toggle(manager.language == .ru ? "Заблокировать" : "Lock annotation",isOn: Binding(get: { AnnotationMetadata.isLocked(annotation) },set: { manager.changeAnnotation(annotation,lock: $0) }))
+                    Toggle(manager.language == .ru ? "Показывать" : "Visible",isOn: Binding(get: { annotation.shouldDisplay },set: { manager.changeAnnotation(annotation,visible: $0) }))
+                    Toggle(manager.language == .ru ? "Печатать" : "Print",isOn: Binding(get: { annotation.shouldPrint },set: { manager.changeAnnotation(annotation,printable: $0) }))
+                    }
                     if annotation.type == "Text" {
                         TextEditor(text: Binding(get: { annotation.contents ?? "" },set: { annotation.contents = $0; manager.send(.refresh) })).frame(minHeight: 80)
                     } else if let contents = annotation.contents,!contents.isEmpty { Text(contents).textSelection(.enabled) }
@@ -2080,7 +2604,42 @@ private struct SourceOrAnnotationProperties: View {
                         Button(manager.language == .ru ? "Изменить ссылку" : "Edit link") { manager.editLink(annotation) }
                     }
                     if annotation.type == "Widget" {
-                        TextField("Field name / Имя поля",text: Binding(get: { annotation.fieldName ?? "" },set: { annotation.fieldName = $0; manager.send(.refresh) }))
+                        TextField("Field name / Имя поля",text: Binding(get: { annotation.fieldName ?? "" },set: { manager.recordFieldChange(); annotation.fieldName = $0; manager.send(.refresh) }))
+                        Toggle(manager.language == .ru ? "Только чтение" : "Read only",isOn: Binding(get: { annotation.isReadOnly },set: { manager.recordFieldChange(); annotation.isReadOnly = $0; manager.send(.refresh) }))
+                        Toggle(manager.language == .ru ? "Обязательное" : "Required",isOn: Binding(get: { ((annotation.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0)&2 != 0 },set: { value in
+                            manager.recordFieldChange(); let flags = (annotation.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0
+                            annotation.setValue(NSNumber(value: value ? flags|2 : flags & ~2),forAnnotationKey: .widgetFieldFlags); manager.send(.refresh)
+                        }))
+                        if annotation.widgetFieldType == .text {
+                            Button(manager.language == .ru ? "Правило проверки значения…" : "Value validation rule…") { manager.send(.feature("formRule")) }
+                            Toggle(manager.language == .ru ? "Несколько строк" : "Multiline",isOn: Binding(get: { annotation.isMultiline },set: { manager.recordFieldChange(); annotation.isMultiline = $0; manager.send(.refresh) }))
+                            TextField(manager.language == .ru ? "Максимум символов (0 — без ограничения)" : "Maximum length (0 = unlimited)",value: Binding(get: { annotation.maximumLength },set: { manager.recordFieldChange(); annotation.maximumLength = min(100000,max(0,$0)); manager.send(.refresh) }),format: .number)
+                            Toggle(manager.language == .ru ? "Ячейки для символов (Comb)" : "Character cells (Comb)",isOn: Binding(get: { annotation.hasComb },set: { value in
+                                manager.recordFieldChange(); if value { annotation.isMultiline = false; if annotation.maximumLength == 0 { annotation.maximumLength = 10 } }; annotation.hasComb = value; manager.send(.refresh)
+                            }))
+                        }
+                        if annotation.widgetFieldType == .choice {
+                            Button(manager.language == .ru ? "Выбрать значения…" : "Select values…") { manager.send(.feature("formValues")) }
+                            Toggle(manager.language == .ru ? "Список вместо выпадающего меню" : "List instead of popup",isOn: Binding(get: { annotation.isListChoice },set: { manager.recordFieldChange(); annotation.isListChoice = $0; manager.send(.refresh) }))
+                            Toggle(manager.language == .ru ? "Множественный выбор" : "Multiple selection",isOn: Binding(get: { ((annotation.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0)&(1<<21) != 0 },set: { value in
+                                manager.recordFieldChange(); let flags = (annotation.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0
+                                annotation.setValue(NSNumber(value: value ? flags|(1<<21) : flags & ~(1<<21)),forAnnotationKey: .widgetFieldFlags); if value { annotation.isListChoice = true }; manager.send(.refresh)
+                            }))
+                            Text(manager.language == .ru ? "Варианты, по одному в строке" : "One choice per line").font(.caption)
+                            TextEditor(text: Binding(get: { (annotation.choices ?? []).joined(separator: "\n") },set: { manager.recordFieldChange(); annotation.choices = Array($0.components(separatedBy: .newlines).prefix(1000)); manager.send(.refresh) })).frame(height: 110)
+                            Text(manager.language == .ru ? "Экспортные значения по порядку (пропуски = подписи)" : "Export values in order (missing = labels)").font(.caption)
+                            TextEditor(text: Binding(get: { (annotation.values ?? annotation.choices ?? []).joined(separator: "\n") },set: { value in
+                                manager.recordFieldChange(); let labels = annotation.choices ?? [],values = value.components(separatedBy: .newlines)
+                                annotation.values = labels.enumerated().map { index,label in index < values.count ? values[index] : label }; manager.send(.refresh)
+                            })).frame(height: 90)
+                        }
+                        if annotation.widgetFieldType == .button {
+                            TextField(manager.language == .ru ? "Экспортное значение / группа определяется именем поля" : "Export value / field name defines the group",text: Binding(get: { annotation.buttonWidgetStateString },set: { manager.recordFieldChange(); annotation.buttonWidgetStateString = $0; manager.send(.refresh) }))
+                            if annotation.widgetControlType == .radioButtonControl {
+                                Toggle(manager.language == .ru ? "Разрешить снять выбор" : "Allow toggle off",isOn: Binding(get: { annotation.allowsToggleToOff },set: { manager.recordFieldChange(); annotation.allowsToggleToOff = $0; manager.send(.refresh) }))
+                                Toggle(manager.language == .ru ? "Одинаковые значения включаются вместе" : "Equal values turn on in unison",isOn: Binding(get: { annotation.radiosInUnison },set: { manager.recordFieldChange(); annotation.radiosInUnison = $0; manager.send(.refresh) }))
+                            }
+                        }
                     } else if annotation.type != "Stamp" { AnnotationStyleControls(manager: manager) }
                 }
             }
@@ -2136,7 +2695,7 @@ private struct FloatingPanelContents: View {
     var body: some View {
         VStack(spacing: 0) {
             PanelHeader(panel: panel, manager: manager)
-            PanelBody(panel: panel, manager: manager)
+            ActivePanelBody(panel: panel, manager: manager)
         }.frame(minWidth: 200, minHeight: 180)
             .background(Palette.panel).foregroundStyle(Palette.text).preferredColorScheme(manager.theme.colorScheme)
     }
@@ -2340,12 +2899,36 @@ private struct PDFViewer: NSViewRepresentable {
         var outlineGeneration = 0
         var sourceAnchor: (index: Int, point: CGPoint)?
         var lastSearchRequestID = -1
+        var lastSearchNavigationID = -1
 
         init(manager: DocumentManager) { self.manager = manager }
         func attach(_ view: PDFViewerView) {
             self.view = view; view.delegate = self
+            view.onFocus = { [weak manager = manager,weak view] in
+                guard let manager else { return }
+                if let parent = manager.parentManager { parent.splitFocused = true } else { manager.splitFocused = false }
+                PDFWindowPool.shared.focus(manager,window: view?.window)
+            }
             manager.finishSourceEditing = { [weak self] in self?.finishSourceEditor() ?? true }
             manager.captureNavigation = { [weak self, weak view] in if let self, let view, let item = self.manager.selected { self.recordNavigation(view, item: item) } }
+            view.engineeringSnapper = { [weak self,weak view] page,point in
+                view?.engineeringSnapIndicator = nil
+                guard let self,let view,self.manager.engineeringSnap,let item = self.manager.selected else { return point }
+                let index = item.document.index(for: page)
+                guard let session = try? self.contentSession(item: item,index: index) else { return point }
+                let threshold = 8/max(0.05,view.scaleFactor)
+                guard let snap = session.snapCandidate(near: point,tolerance: threshold) else { return point }
+                view.engineeringSnapIndicator = (page,snap,snap.kind.title(russian: self.manager.language == .ru)); return snap.point
+            }
+            view.engineeringPreviewText = { [weak self] page,kind,points in
+                guard let self else { return "" }
+                let prefix = "BotPlus engineering calibration v1:"
+                var scale = EngineeringScale(unit: self.manager.engineeringUnit)
+                if let text = page.annotations.first(where: { ($0.contents ?? "").hasPrefix(prefix) })?.contents,let data = Data(base64Encoded: String(text.dropFirst(prefix.count))),let stored = try? JSONDecoder().decode(EngineeringScale.self,from: data),stored.valid { scale.millimetersPerPoint = stored.millimetersPerPoint }
+                if kind == .calibration,points.count >= 2 { return String(format: "%.3f pt",hypot(points.last!.x-points[0].x,points.last!.y-points[0].y)) }
+                return EngineeringMeasure(kind: kind,points: points,scale: scale).label(russian: self.manager.language == .ru)
+            }
+            view.onEngineeringCommit = { [weak self,weak view] page,kind,points in if let self,let view { self.commitEngineering(page: page,kind: kind,points: points,view: view) } }
             view.onSnapshot = { [weak self] page, region in self?.copySnapshot(page: page, region: region) }
             view.onCreateText = { [weak self, weak view] page, point, leader in
                 guard let self, let view else { return }
@@ -2377,6 +2960,7 @@ private struct PDFViewer: NSViewRepresentable {
                 Task { @MainActor [weak self, weak view] in
                     await Task.yield()
                     self?.manager.selectedAnnotation = view?.selectedAnnotation
+                    self?.manager.selectedAnnotationCount = view?.annotationSelectionUnitCount ?? 0
                     if view?.contentSelection == nil { self?.manager.contentProperties.reset() }
                     if let self,let annotation = view?.selectedAnnotation {
                         self.manager.annotationColor = Color(nsColor: annotation.type == "FreeText" ? annotation.fontColor ?? .black : annotation.color)
@@ -2447,6 +3031,7 @@ private struct PDFViewer: NSViewRepresentable {
         }
         private var previousBounds = CGRect.zero
         func update(_ view: PDFViewerView) {
+            manager.invalidateStaleSearch()
             var changed = previousBounds != view.bounds
             previousBounds = view.bounds
             if activeDocumentID != manager.selected?.id || view.document !== manager.selected?.document {
@@ -2455,7 +3040,7 @@ private struct PDFViewer: NSViewRepresentable {
                 lastSearchRequestID = manager.searchRequestID
                 if let popover = textPopover { Task { @MainActor in popover.close() } }
                 if let inline = view.sourceInline { Task { @MainActor in inline.cancel() } }
-                view.contentSelection = nil; view.contentOutlines = []; self.manager.contentProperties.reset()
+                view.engineeringDraft = nil; view.contentSelection = nil; view.contentOutlines = []; self.manager.contentProperties.reset()
                 view.setSourceSelection(nil)
                 view.selectAnnotation(nil)
                 Task { @MainActor [weak self] in self?.manager.selectedContent = nil }
@@ -2475,6 +3060,7 @@ private struct PDFViewer: NSViewRepresentable {
             if view.displayMode != manager.layout.pdfMode { view.displayMode = manager.layout.pdfMode; changed = true }
             if view.displaysAsBook != (manager.layout == .spread) { view.displaysAsBook = manager.layout == .spread; changed = true }
             if view.activeTool != manager.tool {
+                view.engineeringDraft = nil
                 view.activeTool = manager.tool; changed = true
                 if manager.tool == .snapshot { view.selectAnnotation(nil); view.contentSelection = nil; view.setSourceSelection(nil) }
             }
@@ -2490,7 +3076,11 @@ private struct PDFViewer: NSViewRepresentable {
             observeScroll(in: view)
             if manager.searchRequestID != lastSearchRequestID {
                 lastSearchRequestID = manager.searchRequestID
-                if !manager.searchText.isEmpty, let selection = itemSearch(manager.searchText, in: view.document) {
+                manager.runSearch()
+            }
+            if manager.searchNavigationID != lastSearchNavigationID {
+                lastSearchNavigationID = manager.searchNavigationID
+                if let selection = manager.currentSearchSelection {
                     if let item = manager.selected { recordNavigation(view, item: item) }
                     view.setCurrentSelection(selection, animate: true)
                     view.go(to: selection)
@@ -2515,7 +3105,7 @@ private struct PDFViewer: NSViewRepresentable {
             switch command {
             case .rotate,.deletePageAt,.duplicatePageAt,.blankPageAt,.rotatePageAt,.insertBlankPage,.deletePage,.duplicatePage:
                 guard finishSourceEditor() else { return }; manager.recordUndo(item,group: "pages")
-            case .applyAnnotationStyle: if view.selectedAnnotation != nil { manager.recordUndo(item,group: "annotationStyle") }
+            case .applyAnnotationStyle: if view.canModifyAnnotationSelection { manager.recordUndo(item,group: "annotationStyle") }
             default: break
             }
             switch command {
@@ -2582,8 +3172,9 @@ private struct PDFViewer: NSViewRepresentable {
                 reload(view, document: item, pageIndex: index)
                 manager.pageText = String(index + 1); manager.send(.refresh)
             case .applyAnnotationStyle:
-                if let annotation = view.selectedAnnotation {
-                    if annotation.type == "Stamp" { break }
+                guard view.canModifyAnnotationSelection else { break }
+                for annotation in view.selectedAnnotations {
+                    if annotation.type == "Stamp" { continue }
                     annotation.removeValue(forAnnotationKey: .appearanceDictionary)
                     annotation.color = annotation.type == "FreeText" ? .clear : view.strokeColor
                     AnnotationMetadata.setOpacity(manager.annotationOpacity, on: annotation)
@@ -2607,12 +3198,11 @@ private struct PDFViewer: NSViewRepresentable {
                             AnnotationMetadata.setOpacity(manager.annotationOpacity,on: part)
                         }
                     }
-                    view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh)
+                    view.updateEngineeringMeasurement(); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh)
                 }
             case .print:
                 guard view.document != nil, view.document === item.document else { return }
-                let printInfo = NSPrintInfo.shared
-                view.print(with: printInfo, autoRotate: true, pageScaling: .pageScaleDownToFit)
+                showAdvancedPrint(item: item,view: view)
             case .setZoom(let zoom):
                 view.autoScales = false
                 view.scaleFactor = max(view.minScaleFactor, min(view.maxScaleFactor, zoom))
@@ -2698,6 +3288,28 @@ private struct PDFViewer: NSViewRepresentable {
                 guard let self,let view,let item,let properties,item.document === expected else { return }
                 self.changeContent(index: info.index,pageIndex: index,bounds: properties.bounds,rotation: properties.rotation*CGFloat.pi/180,style: properties.style,item: item,view: view)
             }
+            properties.editNodes = { [weak self,weak view] in
+                guard let self,let view,item.document === expected else { return }
+                do {
+                    let nodes = try self.contentSession(item: item,index: index).pathNodes(index: info.index)
+                    self.manager.pathRequest = PDFPathRequest(nodes: nodes,russian: self.manager.language == .ru) { [weak self,weak view] nodes in
+                        guard let self,let view,item.document === expected else { return "Document changed / Документ изменился" }
+                        do {
+                            let data = try self.contentSession(item: item,index: index).replacePath(index: info.index,nodes: nodes)
+                            try self.installSourceData(data,item: item,index: index,view: view,bounds: nil); item.enableStreamPreservation(); self.clearContentSelection(view); self.refreshContentOutlines(view); return nil
+                        } catch { return "This path could not be rebuilt safely. Clipping, tags, patterns or transparency require a deeper editor. / Этот контур нельзя безопасно пересоздать: обрезка, теги, узоры или прозрачность требуют расширенного редактора." }
+                    }
+                } catch { self.sourceError(error) }
+            }
+            properties.arrange = { [weak self,weak view] direction in
+                guard let self,let view,item.document === expected else { return }
+                do {
+                    let (data,newIndex) = try self.contentSession(item: item,index: index).reorder(index: info.index,direction: direction)
+                    try self.installSourceData(data,item: item,index: index,view: view,bounds: nil); item.enableStreamPreservation()
+                    if let page = item.document.page(at: index),let selected = try self.contentSession(item: item,index: index).info(newIndex) { self.activateContent(selected,page: page,item: item,index: index,view: view) }
+                    self.refreshContentOutlines(view)
+                } catch { self.sourceError(error) }
+            }
             properties.delete = { [weak self,weak view] in guard let self,let view else { return }; self.deleteContent(view) }
             properties.replace = { [weak self,weak view,weak item] in
                 guard let self,let view else { return }
@@ -2763,10 +3375,10 @@ private struct PDFViewer: NSViewRepresentable {
             if let error = error as? PDFSourceError { manager.say(error.english, error.russian) }
             else { manager.say("Could not modify the PDF text.", "Не удалось изменить текст PDF.") }
         }
-        private func installSourceData(_ data: Data, item: PDFDocumentItem, index: Int, view: PDFViewerView, bounds: CGRect?, anchor: CGPoint? = nil) throws {
+        private func installSourceData(_ data: Data, item: PDFDocumentItem, index: Int, view: PDFViewerView, bounds: CGRect?, anchor: CGPoint? = nil,restoreBookmarks: Bool = true) throws {
             guard let document = PDFDocument(data: data), document.pageCount == item.pageCount else { throw PDFSourceError.save }
             AnnotationMetadata.restore(document)
-            PDFBookmarkStore.restore(PDFBookmarkStore.capture(item.document),on: document)
+            if restoreBookmarks { PDFBookmarkStore.restore(PDFBookmarkStore.capture(item.document),on: document) }
             manager.recordUndo(item,group: "sourceText")
             item.document = document; item.pageIndex = index
             reload(view, document: item, pageIndex: index,centerPage: false)
@@ -2880,12 +3492,21 @@ private struct PDFViewer: NSViewRepresentable {
             }
             return [annotation]
         }
-        private func annotationClipboardData(_ annotation: PDFAnnotation) -> Data? {
-            guard let page = annotation.page else { return nil }
-            let components = annotationComponents(annotation)
+        private func annotationCopy(_ original: PDFAnnotation) -> PDFAnnotation? {
+            guard let copy = original.copy() as? PDFAnnotation else { return nil }
+            copy.page = nil
+            if let sourcePopup = original.popup {
+                guard let popup = sourcePopup.copy() as? PDFAnnotation else { return nil }; popup.page = nil; copy.popup = popup
+            } else { copy.popup = nil }
+            return copy
+        }
+        private func annotationClipboardData(_ annotation: PDFAnnotation) -> Data? { annotationClipboardData(annotationComponents(annotation)) }
+        private func annotationClipboardData(_ annotations: [PDFAnnotation]) -> Data? {
+            guard let page = annotations.first?.page,page.document?.allowsCopying == true,!annotations.isEmpty,annotations.allSatisfy({ $0.page === page }) else { return nil }
+            let components = page.annotations.filter { candidate in annotations.contains(where: { $0 === candidate }) }
             let clipboardPage = PDFPage(); clipboardPage.setBounds(page.bounds(for: .mediaBox), for: .mediaBox)
             clipboardPage.setBounds(page.bounds(for: .cropBox), for: .cropBox)
-            let copies = components.compactMap { $0.copy() as? PDFAnnotation }
+            let copies = components.compactMap(annotationCopy)
             guard copies.count == components.count else { return nil }
             for copy in copies { copy.page = nil; clipboardPage.addAnnotation(copy) }
             AnnotationMetadata.transfer(from: components, to: copies)
@@ -2894,12 +3515,13 @@ private struct PDFViewer: NSViewRepresentable {
             guard let data = document.dataRepresentation(options: [PDFDocumentWriteOption.saveTextFromOCROption: false]) else { return nil }
             return data
         }
-        private func copyAnnotationObjects(_ annotation: PDFAnnotation, board: NSPasteboard = .general) -> Bool {
-            guard let data = annotationClipboardData(annotation) else { return false }
+        private func copyAnnotationObjects(_ annotation: PDFAnnotation, board: NSPasteboard = .general) -> Bool { copyAnnotationObjects(annotationComponents(annotation),board: board) }
+        private func copyAnnotationObjects(_ annotations: [PDFAnnotation],board: NSPasteboard = .general) -> Bool {
+            guard let data = annotationClipboardData(annotations) else { return false }
             board.clearContents()
             let success = board.setData(data, forType: ObjectClipboard.annotations)
             _ = board.setData(data, forType: .pdf)
-            if let text = annotation.contents { _ = board.setString(text, forType: .string) }
+            let text = annotations.compactMap(\.contents).joined(separator: "\n"); if !text.isEmpty { _ = board.setString(text,forType: .string) }
             return success
         }
         private func sourceSessionForSelection(view: PDFViewerView) throws -> (PDFSourceSession, PDFDocumentItem, Int, String?) {
@@ -2921,12 +3543,14 @@ private struct PDFViewer: NSViewRepresentable {
         }
         private func copyObjects(on view: PDFViewerView, cutting: Bool) {
             defer { manager.refreshClipboard() }
+            guard view.document?.allowsCopying == true else { return }
             if view.contentSelection != nil { _ = copyContent(view,cut: cutting); return }
             if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
                 if cutting { editor.cut(nil) } else { editor.copy(nil) }; return
             }
-            if let annotation = view.selectedAnnotation {
-                if copyAnnotationObjects(annotation) {
+            if view.selectedAnnotation != nil {
+                if cutting && !view.canModifyAnnotationSelection { return }
+                if copyAnnotationObjects(view.selectedAnnotations) {
                     if cutting { _ = view.deleteSelectedAnnotation() }
                 } else { manager.say("Could not write to the clipboard.", "Не удалось записать данные в буфер обмена.") }
                 return
@@ -2965,10 +3589,11 @@ private struct PDFViewer: NSViewRepresentable {
             } catch { sourceError(error) }
         }
         private func pasteAnnotationData(_ data: Data, on view: PDFViewerView) -> Bool {
-            guard let target = view.currentPage, let source = PDFDocument(data: data), let page = source.page(at: 0) else { return false }
+            guard let target = view.currentPage,let document = target.document,document === view.document,let source = PDFDocument(data: data),source.allowsCopying,let page = source.page(at: 0) else { return false }
                 AnnotationMetadata.restore(source)
-                let originals = page.annotations.filter { !AnnotationMetadata.isContainer($0) }
-                let copies = originals.compactMap { $0.copy() as? PDFAnnotation }
+                let originals = page.annotations.filter { $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }
+                guard originals.allSatisfy({ ["Widget","Link"].contains($0.type ?? "") ? document.allowsDocumentChanges : document.allowsCommenting }) else { return false }
+                let copies = originals.compactMap(annotationCopy)
                 guard !copies.isEmpty, copies.count == originals.count else { return false }
                 let union = copies.reduce(CGRect.null) { $0.union($1.bounds) }
                 let center = view.convert(CGPoint(x: view.bounds.midX,y: view.bounds.midY), to: target)
@@ -2977,7 +3602,7 @@ private struct PDFViewer: NSViewRepresentable {
                 let y = min(max(crop.minY, center.y-union.height/2), max(crop.minY,crop.maxY-union.height))
                 for copy in copies { copy.page = nil; copy.bounds = copy.bounds.offsetBy(dx: x-union.minX,dy: y-union.minY); target.addAnnotation(copy) }
                 AnnotationMetadata.transfer(from: originals, to: copies)
-                manager.tool = .selectComments; view.setSourceSelection(nil); view.selectAnnotation(copies.first)
+                manager.tool = .selectComments; view.setSourceSelection(nil); view.selectAnnotations(copies)
                 view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
         }
 
@@ -3022,10 +3647,6 @@ private struct PDFViewer: NSViewRepresentable {
                 if item.zoom != view.scaleFactor { item.zoom = view.scaleFactor }
                 self.scheduleNavigation(view, item: item)
             }
-        }
-
-        private func itemSearch(_ query: String, in document: PDFDocument?) -> PDFSelection? {
-            document?.findString(query, withOptions: [.caseInsensitive]).first
         }
 
         private func addMarkup(on view: PDFViewerView, subtype: PDFAnnotationSubtype) {
@@ -3142,6 +3763,7 @@ private struct PDFViewer: NSViewRepresentable {
             board.clearContents(); _ = board.setData(data,forType: ObjectClipboard.pages); _ = board.setData(data,forType: .pdf)
         }
         private func pastePages(_ index: Int,item: PDFDocumentItem,view: PDFViewerView,board: NSPasteboard = .general) {
+            guard item.document.allowsDocumentAssembly || item.document.allowsDocumentChanges else { return }
             guard finishSourceEditor(),let data = board.data(forType: ObjectClipboard.pages) ?? board.data(forType: .pdf),let document = PDFDocument(data: data),document.pageCount > 0 else {
                 manager.say("No PDF pages in the clipboard.","В буфере обмена нет страниц PDF."); return
             }
@@ -3150,6 +3772,19 @@ private struct PDFViewer: NSViewRepresentable {
             for offset in 0..<document.pageCount {
                 guard let source = document.page(at: offset),let copy = source.copy() as? PDFPage else { continue }
                 AnnotationMetadata.copy(from: source,to: copy); item.document.insert(copy,at: target+offset)
+            }
+            for offset in 0..<document.pageCount {
+                guard let source = document.page(at: offset),let copy = item.document.page(at: target+offset) else { continue }
+                let originals = source.annotations.filter { !AnnotationMetadata.isContainer($0) },duplicates = copy.annotations.filter { !AnnotationMetadata.isContainer($0) }
+                for (a,b) in zip(originals,duplicates) {
+                    guard let destination = (a.action as? PDFActionGoTo)?.destination ?? a.destination,let page = destination.page else { continue }
+                    let local = document.index(for: page)
+                    if local >= 0,local < document.pageCount,let actual = item.document.page(at: target+local) { let value = PDFDestination(page: actual,at: destination.point); value.zoom = destination.zoom; b.destination = value; b.action = PDFActionGoTo(destination: value) }
+                }
+            }
+            if let bookmarks = PDFBookmarkStore.capture(document),!bookmarks.isEmpty {
+                func shifted(_ record: PDFBookmarkStore.Record) -> PDFBookmarkStore.Record { PDFBookmarkStore.Record(title: record.title,page: record.page.map { $0+target },point: record.point,zoom: record.zoom,action: record.action,children: record.children.map(shifted)) }
+                PDFBookmarkStore.restore((PDFBookmarkStore.capture(item.document) ?? [])+bookmarks.map(shifted),on: item.document)
             }
             item.pageIndex = target; reload(view,document: item,pageIndex: target); manager.pageText = String(target+1); manager.send(.refresh)
         }
@@ -3364,16 +3999,23 @@ private final class AnnotationOverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let pdf = pdfView else { return }
         NSBezierPath(rect: bounds).addClip()
-        if let annotation = pdf.selectedAnnotation, let page = annotation.page {
+        for annotation in pdf.selectedAnnotations {
+            guard let page = annotation.page else { continue }
             let rect = convert(pdf.convert(annotation.bounds, from: page), from: pdf)
             NSColor.systemBlue.setStroke()
             let outline = NSBezierPath(rect: rect.insetBy(dx: -2, dy: -2)); outline.lineWidth = 1
             outline.setLineDash([4, 3], count: 2, phase: 0); outline.stroke()
-            for corner in pdf.annotationCorners(annotation) {
+            for corner in pdf.selectedAnnotations.count == 1 ? pdf.annotationCorners(annotation) : [] {
                 let point = convert(pdf.convert(corner, from: page), from: pdf)
                 let handle = NSBezierPath(rect: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8))
                 NSColor.white.setFill(); handle.fill(); NSColor.systemBlue.setStroke(); handle.stroke()
             }
+        }
+        if let marquee = pdf.annotationMarquee {
+            let area = CGRect(x: min(marquee.start.x,marquee.end.x),y: min(marquee.start.y,marquee.end.y),width: abs(marquee.end.x-marquee.start.x),height: abs(marquee.end.y-marquee.start.y))
+            let rect = convert(pdf.convert(area,from: marquee.page),from: pdf)
+            NSColor.systemBlue.withAlphaComponent(0.12).setFill(); NSBezierPath(rect: rect).fill()
+            NSColor.systemBlue.setStroke(); let border = NSBezierPath(rect: rect); border.setLineDash([4,3],count: 2,phase: 0); border.stroke()
         }
         if pdf.activeTool == .editText {
             NSColor(calibratedWhite: 0.55,alpha: 0.9).setStroke()
@@ -3392,6 +4034,36 @@ private final class AnnotationOverlayView: NSView {
                 let path = NSBezierPath(rect: rect); path.lineWidth = 0.6; path.stroke(); budget -= 1
             }
             pdf.drawContentControls(in: self)
+        }
+        if let draft = pdf.engineeringDraft {
+            let points = draft.points+[draft.hover],path = NSBezierPath()
+            for (index,point) in points.enumerated() { let p = convert(pdf.convert(point,from: draft.page),from: pdf); if index == 0 { path.move(to: p) } else { path.line(to: p) } }
+            if draft.kind == .area { path.close() }
+            NSColor.systemCyan.setStroke(); path.lineWidth = 1.3; path.stroke()
+            for point in points { let p = convert(pdf.convert(point,from: draft.page),from: pdf); NSColor.systemCyan.setFill(); NSBezierPath(ovalIn: CGRect(x: p.x-3,y: p.y-3,width: 6,height: 6)).fill() }
+            if let text = pdf.engineeringPreviewText?(draft.page,draft.kind,points),!text.isEmpty {
+                let attributes: [NSAttributedString.Key:Any] = [.font:NSFont.monospacedDigitSystemFont(ofSize: 12,weight: .medium),.foregroundColor:NSColor.white]
+                let size = (text as NSString).size(withAttributes: attributes),cursor = convert(pdf.convert(draft.hover,from: draft.page),from: pdf)
+                let box = CGRect(x: min(bounds.maxX-size.width-12,max(bounds.minX+4,cursor.x+12)),y: min(bounds.maxY-size.height-12,max(bounds.minY+4,cursor.y+12)),width: size.width+8,height: size.height+8)
+                NSColor.black.withAlphaComponent(0.8).setFill(); NSBezierPath(roundedRect: box,xRadius: 4,yRadius: 4).fill()
+                (text as NSString).draw(at: CGPoint(x: box.minX+4,y: box.minY+4),withAttributes: attributes)
+            }
+        }
+        if pdf.engineeringTool != nil,let (page,snap,label) = pdf.engineeringSnapIndicator,page.document === pdf.document {
+            let point = convert(pdf.convert(snap.point,from: page),from: pdf),path = NSBezierPath()
+            switch snap.kind {
+            case .endpoint: path.move(to: CGPoint(x: point.x-4,y: point.y-4)); path.line(to: CGPoint(x: point.x+4,y: point.y-4)); path.line(to: CGPoint(x: point.x+4,y: point.y+4)); path.line(to: CGPoint(x: point.x-4,y: point.y+4)); path.close()
+            case .midpoint: path.move(to: CGPoint(x: point.x,y: point.y+5)); path.line(to: CGPoint(x: point.x-5,y: point.y-4)); path.line(to: CGPoint(x: point.x+5,y: point.y-4)); path.close()
+            case .intersection: path.move(to: CGPoint(x: point.x-5,y: point.y-5)); path.line(to: CGPoint(x: point.x+5,y: point.y+5)); path.move(to: CGPoint(x: point.x-5,y: point.y+5)); path.line(to: CGPoint(x: point.x+5,y: point.y-5))
+            case .extremum: path.appendOval(in: CGRect(x: point.x-5,y: point.y-5,width: 10,height: 10)); path.move(to: CGPoint(x: point.x-7,y: point.y)); path.line(to: CGPoint(x: point.x+7,y: point.y))
+            case .curveMidpoint: path.move(to: CGPoint(x: point.x,y: point.y+5)); path.line(to: CGPoint(x: point.x-5,y: point.y-4)); path.line(to: CGPoint(x: point.x+5,y: point.y-4)); path.close(); path.move(to: CGPoint(x: point.x-6,y: point.y-7)); path.line(to: CGPoint(x: point.x+6,y: point.y-7))
+            case .nearest: path.appendOval(in: CGRect(x: point.x-4,y: point.y-4,width: 8,height: 8))
+            }
+            NSColor.systemGreen.setStroke(); path.lineWidth = 2; path.stroke()
+            let attributes: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize: 10,weight: .semibold),.foregroundColor:NSColor.white]
+            let size = (label as NSString).size(withAttributes: attributes)
+            let rect = CGRect(x: min(bounds.maxX-size.width-12,max(bounds.minX+4,point.x+10)),y: min(bounds.maxY-size.height-12,max(bounds.minY+4,point.y-20)),width: size.width+8,height: size.height+6)
+            NSColor.black.withAlphaComponent(0.8).setFill(); NSBezierPath(roundedRect: rect,xRadius: 3,yRadius: 3).fill(); (label as NSString).draw(at: CGPoint(x: rect.minX+4,y: rect.minY+3),withAttributes: attributes)
         }
         pdf.sourceInline?.drawControls(in: self)
         if pdf.sourceInline == nil, let source = pdf.sourceSelection {
@@ -3415,9 +4087,77 @@ private final class AnnotationOverlayView: NSView {
     }
 }
 
+private enum PDFScreenTileRenderer {
+    static func draw(_ page: PDFPage, to destination: CGContext) {
+        let clip = destination.boundingBoxOfClipPath
+        let transform = destination.ctm
+        guard [clip.minX, clip.minY, clip.width, clip.height,
+               transform.a, transform.b, transform.c, transform.d].allSatisfy(\.isFinite),
+              clip.width > 0, clip.height > 0 else { return }
+        var scaleX = hypot(transform.a, transform.b)
+        var scaleY = hypot(transform.c, transform.d)
+        guard scaleX > 0, scaleY > 0 else { return }
+        // Normally PDFKit requests small tiles. Bound exceptional full-page
+        // requests as well, without allocating a page-sized Retina bitmap.
+        let requestedWidth = clip.width * scaleX
+        let requestedHeight = clip.height * scaleY
+        let pixels = requestedWidth * requestedHeight
+        guard requestedWidth.isFinite, requestedHeight.isFinite, pixels.isFinite else { return }
+        let reduction = min(1, 16_384 / requestedWidth, 16_384 / requestedHeight,
+                            sqrt(16_777_216 / max(1, pixels)))
+        scaleX *= reduction; scaleY *= reduction
+        let pixelWidth = max(1, Int(ceil(clip.width * scaleX)))
+        let pixelHeight = max(1, Int(ceil(clip.height * scaleY)))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        destination.saveGState()
+        defer { destination.restoreGState() }
+        destination.interpolationQuality = .high
+        for y in stride(from: 0, to: pixelHeight, by: 1024) {
+            for x in stride(from: 0, to: pixelWidth, by: 1024) {
+                autoreleasepool {
+                    let width = min(1024, pixelWidth - x)
+                    let height = min(1024, pixelHeight - y)
+                    guard let bitmap = CGContext(data: nil, width: width, height: height,
+                        bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+                    let rect = CGRect(x: clip.minX + CGFloat(x) / scaleX,
+                                      y: clip.minY + CGFloat(y) / scaleY,
+                                      width: CGFloat(width) / scaleX,
+                                      height: CGFloat(height) / scaleY)
+                    bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+                    bitmap.fill(CGRect(x: 0, y: 0, width: width, height: height))
+                    bitmap.scaleBy(x: scaleX, y: scaleY)
+                    bitmap.translateBy(x: -rect.minX, y: -rect.minY)
+                    page.draw(with: .cropBox, to: bitmap)
+                    if let image = bitmap.makeImage() { destination.draw(image, in: rect) }
+                }
+            }
+        }
+    }
+}
+
 @MainActor
 private final class PDFViewerView: PDFView {
+    // PDFKit calls this on its tile workers, not necessarily on the main thread.
+    // Submit images rather than PDF strokes to the layer-backed CGContext: on
+    // affected macOS versions QuartzCore's WideLineRenderer can submit a zero
+    // instance Metal draw and abort while opening an otherwise valid CAD PDF.
+    // The PDF remains vector/editable; only the current screen tiles use Quartz
+    // bitmap rendering, at the destination's pixel density.
+    nonisolated override func draw(_ page: PDFPage, to context: CGContext) {
+        PDFScreenTileRenderer.draw(page, to: context)
+    }
+
     var configuredPageMargin: CGFloat = 2
+    var onFocus: (() -> Void)?
+    var engineeringDraft: (page: PDFPage,kind: EngineeringKind,points: [CGPoint],hover: CGPoint)?
+    var engineeringSnapper: ((PDFPage,CGPoint) -> CGPoint)?
+    var engineeringSnapIndicator: (PDFPage,PDFEngineeringSnap,String)?
+    var engineeringPreviewText: ((PDFPage,EngineeringKind,[CGPoint]) -> String)?
+    var onEngineeringCommit: ((PDFPage,EngineeringKind,[CGPoint]) -> Void)?
+    var engineeringTool: EngineeringKind? {
+        switch activeTool { case .distance: .distance; case .perimeter: .perimeter; case .area: .area; case .calibration: .calibration; default: nil }
+    }
     struct Preview { let page: PDFPage; let start: CGPoint; var end: CGPoint; let tool: PDFTool; var points: [CGPoint] = [] }
     private struct Transform {
         let annotation: PDFAnnotation
@@ -3430,7 +4170,12 @@ private final class PDFViewerView: PDFView {
         var paths: [NSBezierPath] = []
         var recordedHistory = false
     }
-    var activeTool: PDFTool = .hand { didSet { if activeTool != oldValue { contentDrag = nil; contentPreview = nil; window?.invalidateCursorRects(for: self) } } }
+    override var document: PDFDocument? {
+        didSet {
+            if oldValue !== document { batchMove = nil; annotationMarquee = nil; transform = nil; selectAnnotation(nil) }
+        }
+    }
+    var activeTool: PDFTool = .hand { didSet { if activeTool != oldValue { contentDrag = nil; contentPreview = nil; batchMove = nil; annotationMarquee = nil; window?.invalidateCursorRects(for: self) } } }
     var strokeColor: NSColor = .systemRed
     var strokeWidth: CGFloat = 2
     var fillEnabled = false
@@ -3452,12 +4197,21 @@ private final class PDFViewerView: PDFView {
     var sourceBlocks: [(page: PDFPage,block: PDFSourceSession.BlockDescriptor)] = []
     var pendingLinkBounds: CGRect?
     private var sourceDragging = false
+    private var eraserRecorded = false
     var onClipboardCommand: ((ViewerCommand) -> Void)?
     private(set) var sourceSelection: (page: PDFPage, bounds: CGRect)?
     var onSelectionChanged: ((PDFAnnotation?) -> Void)?
     var onAnnotationChanged: (() -> Void)?
     var onCursorChange: ((CGPoint?, CGPoint?) -> Void)?
     private(set) var selectedAnnotation: PDFAnnotation?
+    private(set) var selectedAnnotations: [PDFAnnotation] = []
+    var annotationMarquee: (page: PDFPage,start: CGPoint,end: CGPoint,extending: Bool)?
+    private struct BatchMove {
+        struct Entry { let annotation: PDFAnnotation,bounds: CGRect,measurement: EngineeringMeasure? }
+        let page: PDFPage,start: CGPoint,box: CGRect,entries: [Entry]
+        var recorded = false
+    }
+    private var batchMove: BatchMove?
     private(set) var preview: Preview?
     private var transform: Transform?
     private var panPoint: CGPoint?
@@ -3517,9 +4271,13 @@ private final class PDFViewerView: PDFView {
         if let tracking { addTrackingArea(tracking) }
         super.updateTrackingAreas()
     }
-    override func mouseMoved(with event: NSEvent) { trackCursor(event) }
+    override func mouseMoved(with event: NSEvent) {
+        trackCursor(event)
+        if var draft = engineeringDraft { let point = convert(convert(event.locationInWindow,from: nil),to: draft.page); draft.hover = engineeringSnapper?(draft.page,point) ?? point; engineeringDraft = draft; refreshOverlay() }
+        else if engineeringTool != nil,let page = page(for: convert(event.locationInWindow,from: nil),nearest: false) { _ = engineeringSnapper?(page,convert(convert(event.locationInWindow,from: nil),to: page)); refreshOverlay() }
+    }
     override func mouseEntered(with event: NSEvent) { trackCursor(event) }
-    override func mouseExited(with event: NSEvent) { onCursorChange?(nil, nil) }
+    override func mouseExited(with event: NSEvent) { onCursorChange?(nil, nil); engineeringSnapIndicator = nil; refreshOverlay() }
     private func trackCursor(_ event: NSEvent) {
         let local = convert(event.locationInWindow, from: nil)
         let viewport = CGPoint(x: local.x - bounds.minX, y: isFlipped ? local.y - bounds.minY : bounds.maxY - local.y)
@@ -3547,6 +4305,7 @@ private final class PDFViewerView: PDFView {
             if let hit = inline.hit(at: local),inline.owns(hit) { return hit }
         }
         switch activeTool {
+        case .distance,.perimeter,.area,.calibration: return self
         case .hand,.typewriter,.rectangle,.ellipse,.cloud,.pencil,.eraser,.note,.stamp,.link,.marquee,.snapshot,.formText,.formCheckbox,.formRadio,.formChoice,.formButton,.line,.arrow,.callout,.selectComments,.addText,.editText,.editContent:
             // Do not ask PDFKit to probe its text layer in non-selection modes.
             return self
@@ -3559,19 +4318,64 @@ private final class PDFViewerView: PDFView {
         case .hand: addCursorRect(visibleRect, cursor: .openHand)
         case .textSelection, .highlight, .underline, .strike, .typewriter, .addText, .editText: addCursorRect(visibleRect, cursor: .iBeam)
         case .editContent: addCursorRect(visibleRect,cursor: .arrow)
-        case .rectangle, .ellipse, .cloud, .pencil, .eraser, .link, .marquee, .snapshot, .note, .stamp, .formText, .formCheckbox, .formRadio, .formChoice, .formButton, .line, .arrow, .callout: addCursorRect(visibleRect, cursor: .crosshair)
+        case .distance,.perimeter,.area,.calibration,.rectangle, .ellipse, .cloud, .pencil, .eraser, .link, .marquee, .snapshot, .note, .stamp, .formText, .formCheckbox, .formRadio, .formChoice, .formButton, .line, .arrow, .callout: addCursorRect(visibleRect, cursor: .crosshair)
         default: break
         }
     }
     func setSourceSelection(_ selection: (PDFPage, CGRect)?) {
         sourceSelection = selection.map { (page: $0.0, bounds: $0.1) }; refreshOverlay()
     }
-    func selectAnnotation(_ annotation: PDFAnnotation?) {
-        if annotation != nil { sourceSelection = nil }
-        if let annotation, let group = AnnotationMetadata.group(of: annotation), let page = annotation.page {
-            selectedAnnotation = page.annotations.first { $0.type == "FreeText" && AnnotationMetadata.group(of: $0) == group } ?? annotation
-        } else { selectedAnnotation = annotation }
+    func selectAnnotation(_ annotation: PDFAnnotation?,extending: Bool = false,toggle: Bool = false) {
+        selectAnnotations(annotation.map { [$0] } ?? [],extending: extending,toggle: toggle)
+    }
+    func selectAnnotations(_ annotations: [PDFAnnotation],extending: Bool = false,toggle: Bool = false) {
+        guard let page = annotations.first?.page,page.document === document else {
+            if !extending { selectedAnnotations = []; selectedAnnotation = nil }; refreshOverlay(); onSelectionChanged?(selectedAnnotation); return
+        }
+        let requested = annotations.filter { $0.page === page && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }
+        let groups = Set(requested.compactMap(AnnotationMetadata.group))
+        let expanded = page.annotations.filter { candidate in requested.contains(where: { $0 === candidate }) || AnnotationMetadata.group(of: candidate).map(groups.contains) == true }
+        var ids = extending && selectedAnnotations.first?.page === page ? Set(selectedAnnotations.map(ObjectIdentifier.init)) : []
+        let removing = toggle && !expanded.isEmpty && expanded.allSatisfy { ids.contains(ObjectIdentifier($0)) }
+        for annotation in expanded { if removing { ids.remove(ObjectIdentifier(annotation)) } else { ids.insert(ObjectIdentifier(annotation)) } }
+        selectedAnnotations = page.annotations.filter { ids.contains(ObjectIdentifier($0)) && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }
+        let preferred = requested.last,preferredGroup = preferred.flatMap(AnnotationMetadata.group)
+        let family = selectedAnnotations.filter { $0 === preferred || (preferredGroup != nil && AnnotationMetadata.group(of: $0) == preferredGroup) }
+        selectedAnnotation = family.first(where: { AnnotationMetadata.measurement($0) != nil }) ?? family.first(where: { $0.type == "FreeText" }) ?? family.last ?? selectedAnnotations.last
+        if selectedAnnotation != nil { sourceSelection = nil }
         refreshOverlay(); onSelectionChanged?(selectedAnnotation)
+    }
+    var annotationSelectionUnitCount: Int {
+        Set(selectedAnnotations.map { AnnotationMetadata.group(of: $0).map { "group:"+$0 } ?? "annotation:"+String(describing: ObjectIdentifier($0)) }).count
+    }
+    var canModifyAnnotationSelection: Bool {
+        guard let first = selectedAnnotations.first,let page = first.page,let document = page.document,document === self.document,!selectedAnnotations.isEmpty else { return false }
+        return selectedAnnotations.allSatisfy { $0.page === page && !AnnotationMetadata.isLocked($0) && (["Widget","Link"].contains($0.type ?? "") ? document.allowsDocumentChanges : document.allowsCommenting) }
+    }
+    var annotationSelectionBounds: CGRect { selectedAnnotations.reduce(CGRect.null) { $0.union($1.bounds) } }
+    func selectAnnotations(in rectangle: CGRect,page: PDFPage,extending: Bool = false) {
+        selectAnnotations(page.annotations.filter { $0.shouldDisplay && $0.type != "Widget" && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) && $0.bounds.intersects(rectangle) },extending: extending)
+    }
+    private func selectionMoveEntries() -> [BatchMove.Entry] {
+        let roots = selectedAnnotations,popups = roots.compactMap(\.popup).filter { popup in popup.page === roots.first?.page && !roots.contains(where: { $0 === popup }) }
+        return (roots+popups).map { BatchMove.Entry(annotation: $0,bounds: $0.bounds,measurement: AnnotationMetadata.measurement($0)) }
+    }
+    private func translation(_ requested: CGPoint,box: CGRect,page: PDFPage) -> CGPoint {
+        let crop = page.bounds(for: .cropBox)
+        func clamp(_ value: CGFloat,_ low: CGFloat,_ high: CGFloat) -> CGFloat { low <= high ? min(high,max(low,value)) : 0 }
+        return CGPoint(x: clamp(requested.x,crop.minX-box.minX,crop.maxX-box.maxX),y: clamp(requested.y,crop.minY-box.minY,crop.maxY-box.maxY))
+    }
+    private func move(_ entries: [BatchMove.Entry],by delta: CGPoint) {
+        for entry in entries {
+            entry.annotation.bounds = entry.bounds.offsetBy(dx: delta.x,dy: delta.y)
+            if var measure = entry.measurement { measure.points = measure.points.map { CGPoint(x: $0.x+delta.x,y: $0.y+delta.y) }; AnnotationMetadata.setMeasurement(measure,on: entry.annotation) }
+        }
+    }
+    @discardableResult func translateAnnotationSelection(dx: CGFloat,dy: CGFloat) -> Bool {
+        guard canModifyAnnotationSelection,dx.isFinite,dy.isFinite,let page = selectedAnnotations.first?.page else { return false }
+        let delta = translation(CGPoint(x: dx,y: dy),box: annotationSelectionBounds,page: page)
+        guard delta != .zero else { return true }
+        onWillModify?(); move(selectionMoveEntries(),by: delta); refreshOverlay(); setNeedsDisplay(bounds); onAnnotationChanged?(); return true
     }
     func updateCalloutLeader(for annotation: PDFAnnotation) {
         guard annotation.type == "FreeText", let group = AnnotationMetadata.group(of: annotation), let page = annotation.page,
@@ -3618,6 +4422,7 @@ private final class PDFViewerView: PDFView {
         return [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
     }
     override func mouseDown(with event: NSEvent) {
+        onFocus?()
         trackCursor(event)
         if activeTool == .hand {
             window?.makeFirstResponder(self)
@@ -3625,6 +4430,15 @@ private final class PDFViewerView: PDFView {
             panPoint = event.locationInWindow; NSCursor.closedHand.push(); cursorPushed = true; return
         }
         let local = convert(event.locationInWindow, from: nil)
+        if let kind = engineeringTool,let page = page(for: local,nearest: false) {
+            window?.makeFirstResponder(self)
+            let raw = convert(local,to: page),point = engineeringSnapper?(page,raw) ?? raw
+            if engineeringDraft?.page !== page || engineeringDraft?.kind != kind { engineeringDraft = (page,kind,[],point) }
+            if let last = engineeringDraft?.points.last,hypot(last.x-point.x,last.y-point.y) < 0.1 { if event.clickCount >= 2 { finishEngineering() }; return }
+            engineeringDraft?.points.append(point); engineeringDraft?.hover = point; refreshOverlay()
+            if kind == .distance || kind == .calibration { if engineeringDraft?.points.count == 2 { finishEngineering() } }
+            else if event.clickCount >= 2 { finishEngineering() }; return
+        }
         if let inline = sourceInline,let handle = inline.handle(at: local) {
             sourceDragging = true; inline.beginDrag(handle,at: convert(local,to: inline.page)); return
         }
@@ -3650,7 +4464,7 @@ private final class PDFViewerView: PDFView {
         if activeTool == .selectComments {
             setSourceSelection(nil)
             window?.makeFirstResponder(self)
-            if let annotation = selectedAnnotation, annotation.page === page {
+            if selectedAnnotations.count == 1,let annotation = selectedAnnotation, annotation.page === page,!AnnotationMetadata.isLocked(annotation),!event.modifierFlags.contains(.command),!event.modifierFlags.contains(.shift) {
                 let corner = annotationCorners(annotation).firstIndex { corner in
                     let handle = convert(corner, from: page)
                     return hypot(handle.x - local.x, handle.y - local.y) <= 9
@@ -3660,11 +4474,21 @@ private final class PDFViewerView: PDFView {
                     return
                 }
             }
-            let annotation = page.annotations.reversed().first { $0.shouldDisplay && !AnnotationMetadata.isContainer($0) && $0.bounds.insetBy(dx: -3, dy: -3).contains(point) }
-            selectAnnotation(annotation)
-            if let annotation = selectedAnnotation {
-                if event.clickCount == 2 && annotation.type == "FreeText" { onEditText?(annotation); return }
-                transform = Transform(annotation: annotation, page: page, start: point, bounds: annotation.bounds, corner: nil, lineStart: annotation.startPoint, lineEnd: annotation.endPoint,paths: (annotation.paths ?? []).compactMap { $0.copy() as? NSBezierPath })
+            let annotation = page.annotations.reversed().first { $0.shouldDisplay && $0.type != "Widget" && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) && $0.bounds.insetBy(dx: -3,dy: -3).contains(point) }
+            let additive = event.modifierFlags.contains(.command) || event.modifierFlags.contains(.shift)
+            if let annotation {
+                if additive || !selectedAnnotations.contains(where: { $0 === annotation }) { selectAnnotation(annotation,extending: additive,toggle: event.modifierFlags.contains(.command)) }
+                if additive { return }
+                if canModifyAnnotationSelection,selectedAnnotations.count > 1 {
+                    batchMove = BatchMove(page: page,start: point,box: annotationSelectionBounds,entries: selectionMoveEntries()); return
+                }
+                if let annotation = selectedAnnotation,canModifyAnnotationSelection {
+                    if event.clickCount == 2 && annotation.type == "FreeText" { onEditText?(annotation); return }
+                    transform = Transform(annotation: annotation,page: page,start: point,bounds: annotation.bounds,corner: nil,lineStart: annotation.startPoint,lineEnd: annotation.endPoint,paths: (annotation.paths ?? []).compactMap { $0.copy() as? NSBezierPath })
+                }
+            } else {
+                if !additive { selectAnnotation(nil) }
+                annotationMarquee = (page,point,point,additive); refreshOverlay()
             }
             return
         }
@@ -3675,13 +4499,13 @@ private final class PDFViewerView: PDFView {
         case .typewriter: onCreateText?(page, point, nil)
         case .note, .stamp, .formText, .formCheckbox, .formRadio, .formChoice, .formButton: onPlaceObject?(page,point,activeTool)
         case .eraser:
-            let annotation = page.annotations.reversed().first { $0.shouldDisplay && !AnnotationMetadata.isContainer($0) && $0.bounds.insetBy(dx: -4,dy: -4).contains(point) }
-            selectAnnotation(annotation); _ = deleteSelectedAnnotation()
+            eraserRecorded = false; eraseInk(page: page,point: point,whole: event.modifierFlags.contains(.option))
         case .rectangle, .ellipse, .cloud, .pencil, .link, .marquee, .snapshot, .line, .arrow, .callout: preview = Preview(page: page, start: point, end: point, tool: activeTool); refreshOverlay()
         default: super.mouseDown(with: event)
         }
     }
     override func mouseDragged(with event: NSEvent) {
+        if engineeringTool != nil { mouseMoved(with: event); return }
         trackCursor(event)
         if let drag = contentDrag,let selected = contentSelection {
             let point = convert(convert(event.locationInWindow,from: nil),to: selected.page)
@@ -3697,6 +4521,22 @@ private final class PDFViewerView: PDFView {
                 next = CGRect(x: x0,y: y0,width: x1-x0,height: y1-y0)
             } else { next.origin.x += dx; next.origin.y += dy }
             contentPreview = (next,angle); refreshOverlay(); return
+        }
+        if var marquee = annotationMarquee {
+            marquee.end = convert(convert(event.locationInWindow,from: nil),to: marquee.page); annotationMarquee = marquee; refreshOverlay(); return
+        }
+        if var change = batchMove {
+            guard canModifyAnnotationSelection else { batchMove = nil; return }
+            let point = convert(convert(event.locationInWindow,from: nil),to: change.page)
+            let delta = translation(CGPoint(x: point.x-change.start.x,y: point.y-change.start.y),box: change.box,page: change.page)
+            if delta != .zero && !change.recorded { onWillModify?(); change.recorded = true }
+            if change.recorded { move(change.entries,by: delta); setNeedsDisplay(bounds); refreshOverlay() }
+            batchMove = change; return
+        }
+        if activeTool == .eraser {
+            let local = convert(event.locationInWindow,from: nil)
+            if let page = page(for: local,nearest: false) { eraseInk(page: page,point: convert(local,to: page),whole: event.modifierFlags.contains(.option)) }
+            return
         }
         if sourceDragging,let inline = sourceInline {
             inline.drag(to: convert(convert(event.locationInWindow,from: nil),to: inline.page)); return
@@ -3750,6 +4590,7 @@ private final class PDFViewerView: PDFView {
         super.mouseDragged(with: event)
     }
     override func mouseUp(with event: NSEvent) {
+        if activeTool == .eraser { if eraserRecorded { eraserRecorded = false; onAnnotationChanged?() }; return }
         if contentDrag != nil {
             contentDrag = nil
             if let selected = contentSelection,let preview = contentPreview { contentPreview = nil; onContentTransform?(selected.page,selected.object,preview.bounds,preview.angle) }
@@ -3760,21 +4601,36 @@ private final class PDFViewerView: PDFView {
             preview = nil; commitDrawing(drawing); refreshOverlay()
             if ![PDFTool.marquee,.snapshot,.link].contains(drawing.tool) { onAnnotationChanged?() }; return
         }
-        if transform != nil { transform = nil; onAnnotationChanged?(); return }
+        if let marquee = annotationMarquee {
+            annotationMarquee = nil
+            let area = CGRect(x: min(marquee.start.x,marquee.end.x),y: min(marquee.start.y,marquee.end.y),width: abs(marquee.end.x-marquee.start.x),height: abs(marquee.end.y-marquee.start.y))
+            selectAnnotations(in: area,page: marquee.page,extending: marquee.extending); return
+        }
+        if let change = batchMove { batchMove = nil; if change.recorded { onAnnotationChanged?() }; refreshOverlay(); return }
+        if transform != nil { transform = nil; updateEngineeringMeasurement(); onAnnotationChanged?(); return }
         if panPoint != nil {
             panPoint = nil; if cursorPushed { NSCursor.pop(); cursorPushed = false }; return
         }
+        if engineeringTool != nil { return }
         super.mouseUp(with: event)
     }
     func deleteSelectedAnnotation() -> Bool {
-        guard let annotation = selectedAnnotation, let page = annotation.page else { return false }
-        onWillModify?()
-        if let group = AnnotationMetadata.group(of: annotation) {
-            for component in page.annotations where AnnotationMetadata.group(of: component) == group { page.removeAnnotation(component) }
-        } else { page.removeAnnotation(annotation) }
+        guard canModifyAnnotationSelection else { return false }
+        onWillModify?(); for annotation in selectedAnnotations { if let popup = annotation.popup { popup.page?.removeAnnotation(popup); annotation.popup = nil }; annotation.page?.removeAnnotation(annotation) }
         selectAnnotation(nil); setNeedsDisplay(bounds); onAnnotationChanged?(); return true
     }
     override func keyDown(with event: NSEvent) {
+        if engineeringDraft != nil && (event.keyCode == 36 || event.keyCode == 76) { finishEngineering(); return }
+        if engineeringDraft != nil && event.keyCode == 53 { engineeringDraft = nil; refreshOverlay(); return }
+        if activeTool == .selectComments,event.modifierFlags.contains(.command),event.keyCode == 0,let page = currentPage {
+            selectAnnotations(page.annotations.filter { $0.shouldDisplay && $0.type != "Widget" && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }); return
+        }
+        if activeTool == .selectComments,[123,124,125,126].contains(event.keyCode),!selectedAnnotations.isEmpty,let page = selectedAnnotations.first?.page {
+            let amount: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1,step = amount*scaleFactor
+            let local = CGPoint(x: event.keyCode == 123 ? -step : event.keyCode == 124 ? step : 0,y: event.keyCode == 126 ? (isFlipped ? -step : step) : event.keyCode == 125 ? (isFlipped ? step : -step) : 0)
+            let origin = convert(CGPoint.zero,to: page),end = convert(local,to: page)
+            _ = translateAnnotationSelection(dx: end.x-origin.x,dy: end.y-origin.y); return
+        }
         if event.modifierFlags.contains(.command) {
             switch event.keyCode {
             case 6: onClipboardCommand?(.feature(event.modifierFlags.contains(.shift) ? "redo" : "undo")); return
@@ -3788,7 +4644,7 @@ private final class PDFViewerView: PDFView {
             if activeTool == .selectComments && deleteSelectedAnnotation() { return }
             if sourceSelection != nil { onClipboardCommand?(.deleteSelection); return }
         }
-        if event.keyCode == 53 { contentSelection = nil; contentPreview = nil; contentDrag = nil; onSelectionChanged?(nil); selectAnnotation(nil); setSourceSelection(nil); preview = nil; transform = nil; refreshOverlay(); return }
+        if event.keyCode == 53 { contentSelection = nil; contentPreview = nil; contentDrag = nil; onSelectionChanged?(nil); selectAnnotation(nil); setSourceSelection(nil); preview = nil; transform = nil; batchMove = nil; annotationMarquee = nil; refreshOverlay(); return }
         super.keyDown(with: event)
     }
     private func commitDrawing(_ drawing: Preview) {
@@ -4138,7 +4994,8 @@ private extension PDFViewer.Coordinator {
             if tool == .note { manager.annotationColor = .yellow; manager.annotationOpacity = 1 }
             manager.tool = tool; manager.panels.select(.properties); manager.refreshPresentation(); return }
         let page = view.currentPage ?? item.document.page(at: item.pageIndex)
-        if ["bookmarkCase","bookmarkZoom","bookmarkActions","bookmarkSort","bookmarkMerge","bookmarkTOC","bookmarkSortPages","bookmarkLinks","clear"].contains(id) { manager.recordUndo(item,group: id) }
+        if ["bookmarkSortPages","bookmarkLinks","clear"].contains(id) { manager.recordUndo(item,group: id) }
+        if performAdditionalFeature(id,on: view,item: item) { return }
         switch id {
         case "margins","background": showFormatting(id, item: item, view: view)
         case "signature", "initials", "stamp": showGraphicMark(id, item: item, view: view)
@@ -4202,30 +5059,19 @@ private extension PDFViewer.Coordinator {
                 } catch { self.manager.say("Cannot read UTF-8 text file.","Не удалось прочитать текстовый файл UTF-8.") }
             }
         case "bookmarkAddText","bookmarkFind":
-            PDFDialogs.prompt(manager.language == .ru ? "Изменить закладки" : "Modify bookmarks",fields: id == "bookmarkFind" ? [("Find / Найти",""),("Replace / Заменить","")] : [("Prefix / Префикс",""),("Suffix / Суффикс","")]) { [weak self] values in
-                guard let self else { return }
-                self.manager.recordUndo(item,group: "bookmarks")
-                let nodes = self.manager.selectedOutline.map { [$0]+self.manager.bookmarkNodes($0) } ?? self.manager.bookmarkNodes()
-                for node in nodes { let label = node.label ?? ""; node.label = id == "bookmarkFind" ? (values[0].isEmpty ? label : label.replacingOccurrences(of: values[0],with: values[1])) : values[0]+label+values[1] }; self.manager.send(.refresh)
-            }
+            showBookmarkTextEditor(item: item,operation: id == "bookmarkFind" ? .replace : .affix)
         case "bookmarkCase":
-            PDFDialogs.prompt("Case / Регистр",fields: [("1: UPPER / ВЕРХНИЙ; 2: lower / нижний; 3: Title / Заглавные","1")]) { [weak self] values in
-                guard let self else { return }; self.manager.recordUndo(item,group: "bookmarks")
-                for node in self.manager.selectedOutline.map({ [$0]+self.manager.bookmarkNodes($0) }) ?? self.manager.bookmarkNodes() {
-                    let text = node.label ?? ""; node.label = values[0] == "2" ? text.lowercased() : (values[0] == "3" ? text.capitalized : text.uppercased())
-                }; self.manager.send(.refresh)
-            }
+            showBookmarkTextEditor(item: item,operation: .letterCase)
         case "bookmarkZoom":
-            for node in manager.selectedOutline.map({ [$0]+manager.bookmarkNodes($0) }) ?? manager.bookmarkNodes() { node.destination?.zoom = view.scaleFactor }; manager.send(.refresh)
+            showBookmarkTextEditor(item: item,operation: .zoom,zoom: Double(view.scaleFactor*100))
         case "bookmarkActions":
-            for node in manager.selectedOutline.map({ [$0]+manager.bookmarkNodes($0) }) ?? manager.bookmarkNodes() { node.action = nil; node.destination = nil }; manager.send(.refresh)
+            showBookmarkTextEditor(item: item,operation: .clearActions)
         case "bookmarkSort":
-            if let root = manager.selectedOutline ?? manager.bookmarkRoot() { sortBookmarks(root) }; manager.send(.refresh)
+            showBookmarkTextEditor(item: item,operation: .sort)
         case "bookmarkMerge":
-            if let root = manager.bookmarkRoot() { mergeBookmarks(root,document: item.document) }; manager.send(.refresh)
+            showBookmarkTextEditor(item: item,operation: .merge)
         case "bookmarkValidate":
-            let nodes = manager.bookmarkNodes(),invalid = nodes.filter { $0.destination?.page == nil || item.document.index(for: $0.destination!.page!) == NSNotFound }.count
-            manager.say("Bookmarks: \(nodes.count); invalid page targets: \(invalid)","Закладок: \(nodes.count); недействительных целей: \(invalid)")
+            showBookmarkValidation(item: item)
         case "bookmarkText","bookmarkHTML": exportBookmarks(html: id == "bookmarkHTML",item: item)
         case "bookmarkTOC": createTOC(item: item,view: view)
         case "bookmarkLinks":
@@ -4241,7 +5087,7 @@ private extension PDFViewer.Coordinator {
         case "blank": manager.createBlankDocument()
         case "fromFiles","insert": importPages(item: item,view: view)
         case "extract","split","swap": showPageWorkflow(id, item: item, view: view)
-        case "crop":
+        case "cropLegacy":
             guard let page else { return }
             PDFDialogs.prompt("Crop / Обрезка",fields: [("Inset, pt / Отступ, pt","18")]) { [weak self,weak view] values in
                 guard let self,let view,let inset = Double(values[0]),inset >= 0 else { return }
@@ -4252,7 +5098,7 @@ private extension PDFViewer.Coordinator {
         case "exportComments": exportComments(item: item)
         case "importComments": importComments(item: item,view: view)
         case "clear":
-            for index in 0..<item.pageCount { for field in item.document.page(at: index)?.annotations ?? [] where field.type == "Widget" { field.widgetStringValue = ""; field.buttonWidgetState = .offState } }; view.setNeedsDisplay(view.bounds); manager.send(.refresh)
+            for index in 0..<item.pageCount { for field in item.document.page(at: index)?.annotations ?? [] where field.type == "Widget" { AnnotationMetadata.clearFormSelections(field); field.widgetStringValue = ""; field.buttonWidgetState = .offState } }; view.setNeedsDisplay(view.bounds); manager.send(.refresh)
         case "fill": manager.tool = .textSelection; view.isInMarkupMode = false
         case "selectFields": manager.tool = .selectComments
         case "export": exportFormData(item: item)
@@ -4299,23 +5145,32 @@ private extension PDFViewer.Coordinator {
         }
     }
     func createTOC(item: PDFDocumentItem,view: PDFViewerView) {
-        guard let root = manager.bookmarkRoot() else { return }
-        let rows = makeBookmarkRows(root: root,document: item.document).filter { $0.pageIndex >= 0 }
-        guard !rows.isEmpty else { manager.say("Create bookmarks first.","Сначала создайте закладки."); return }
-        let font = NSFont.systemFont(ofSize: 12)
-        var batches: [[BookmarkRow]] = [],batch: [BookmarkRow] = [],used: CGFloat = 0
-        for row in rows {
-            let sample = String(repeating: "  ",count: min(8,row.depth))+row.title+" .... 9999"
-            let height = (sample as NSString).boundingRect(with: CGSize(width: 532,height: 10000),options: [.usesLineFragmentOrigin,.usesFontLeading],attributes: [.font: font]).height+18
-            if !batch.isEmpty && used+height > 650 { batches.append(batch); batch = []; used = 0 }
-            batch.append(row); used += height
-        }
-        if !batch.isEmpty { batches.append(batch) }
-        let pages = batches.count
-        for batch in batches.reversed() {
-            let text = (manager.language == .ru ? "СОДЕРЖАНИЕ" : "TABLE OF CONTENTS")+"\n\n"+batch.map { String(repeating: "  ",count: min(8,$0.depth))+$0.title+" .... \($0.pageIndex+pages+1)" }.joined(separator: "\n\n")
-            if let page = PDFRasterizer.textPage(text) { item.document.insert(page,at: 0) }
-        }; reload(view,document: item,pageIndex: 0); manager.send(.refresh)
+        guard item.document.allowsDocumentAssembly || item.document.allowsDocumentChanges,manager.finishSourceEditing?() != false else { return }
+        let document = item.document,undoGroup = "tableOfContents-"+UUID().uuidString
+        var stamp = PDFDocumentState.stamp(document)
+        manager.tocRequest = PDFTOCRequest(russian: manager.language == .ru,load: { options in
+            guard item.document === document else { throw PDFTOCError.layout }
+            let result = try PDFTOCRenderer.render(entries: PDFTOCRenderer.entries(document: document,options: options),options: options)
+            stamp = PDFDocumentState.stamp(document)
+            return result
+        },apply: { [weak self,weak view] result in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,
+                  document.allowsDocumentAssembly || document.allowsDocumentChanges else { return "Документ изменён. Обновите предпросмотр / Document changed. Update the preview" }
+            guard let generated = PDFDocument(data: result.data),generated.pageCount == result.pageCount,
+                  result.links.allSatisfy({ (0..<document.pageCount).contains(document.index(for: $0.target.page)) }),
+                  let _ = self.manager.snapshot(item) else { return "Не удалось подготовить вставку / Could not prepare insertion" }
+            let pages = (0..<generated.pageCount).compactMap { generated.page(at: $0)?.copy() as? PDFPage }
+            guard pages.count == generated.pageCount else { return "Не удалось прочитать содержание / Could not read table of contents" }
+            self.manager.recordUndo(item,group: undoGroup)
+            for (index,page) in pages.enumerated() { document.insert(page,at: index) }
+            for link in result.links {
+                let annotation = PDFAnnotation(bounds: link.bounds,forType: .link,withProperties: nil)
+                annotation.destination = PDFDestination(page: link.target.page,at: link.target.point)
+                pages[link.pageIndex].addAnnotation(annotation)
+            }
+            item.navigation.reset(); item.selectedPages = [0]; self.manager.navigationRevision &+= 1
+            self.reload(view,document: item,pageIndex: 0); self.manager.send(.refresh); return nil
+        })
     }
     func sortPagesByBookmarks(item: PDFDocumentItem,view: PDFViewerView) {
         let indices = manager.bookmarkNodes().compactMap { $0.destination?.page.map { item.document.index(for: $0) } }.filter { $0 >= 0 && $0 < item.pageCount }
@@ -4395,29 +5250,59 @@ private extension PDFViewerView {
 private final class PDFWindowPool: NSObject,NSWindowDelegate {
     static let shared = PDFWindowPool()
     private var windows: [NSWindow] = []
+    private var closing = Set<ObjectIdentifier>()
     private var managers: [ObjectIdentifier: DocumentManager] = [:]
-    var allManagers: [DocumentManager] { Array(managers.values) }
+    private var focused: [ObjectIdentifier:DocumentManager] = [:]
+    var allManagers: [DocumentManager] { Array(managers.values).flatMap { [$0]+($0.splitManager.map { [$0] } ?? []) } }
+    func focus(_ manager: DocumentManager,window: NSWindow?) { if let window { focused[ObjectIdentifier(window)] = manager } }
+    func clearFocus(_ manager: DocumentManager) { focused = focused.filter { $0.value !== manager } }
     func manager(for window: NSWindow?) -> DocumentManager? {
         guard let window else { return nil }
-        return managers[ObjectIdentifier(window)]
+        return focused[ObjectIdentifier(window)] ?? managers[ObjectIdentifier(window)]
     }
-    func open() {
+    func open(item: PDFDocumentItem? = nil) {
         let window = NSWindow(contentRect: CGRect(x: 80,y: 80,width: 1280,height: 820),styleMask: [.titled,.closable,.miniaturizable,.resizable,.fullSizeContentView],backing: .buffered,defer: false)
         let manager = DocumentManager()
+        if let item { manager.insertDocument(item) }
         managers[ObjectIdentifier(window)] = manager
         window.contentView = NSHostingView(rootView: ContentView(manager: manager).frame(minWidth: 1060,minHeight: 700)); window.title = BotPlusBrand.name; window.isReleasedWhenClosed = false; window.delegate = self
         windows.append(window); window.makeKeyAndOrderFront(nil)
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        let key = ObjectIdentifier(sender)
+        if closing.remove(key) != nil { return true }
+        guard let owner = managers[key] else { return true }
+        let owners = [owner]+(owner.splitManager.map { [$0] } ?? [])
+        guard owners.allSatisfy({ $0.operationTask == nil && $0.loadingFiles == 0 && $0.finishSourceEditing?() != false }),sender.attachedSheet == nil else { return false }
+        let views = owners.flatMap(\.documents),ids = Set(views.map(\.id))
+        let retained = DocumentManager.workspaceManagers.flatMap(\.documents).filter { !ids.contains($0.id) }
+        let dirty = views.filter { item in item.store.hasChanges && !retained.contains(where: { $0.store === item.store }) }
+        guard !dirty.isEmpty else { return true }
+        let alert = NSAlert(); alert.messageText = owner.language == .ru ? "Закрыть окно без сохранения?" : "Close window without saving?"
+        alert.informativeText = Array(Set(dirty.map(\.filename))).sorted().joined(separator: "\n")
+        alert.addButton(withTitle: owner.language == .ru ? "Отмена" : "Cancel"); alert.addButton(withTitle: owner.language == .ru ? "Закрыть без сохранения" : "Close without saving")
+        alert.beginSheetModal(for: sender) { [weak self,weak sender] response in
+            if response == .alertSecondButtonReturn { DispatchQueue.main.async { guard let self,let sender else { return }; self.closing.insert(key); sender.performClose(nil) } }
+        }
+        return false
     }
     func windowWillClose(_ notification: Notification) {
         if let window = notification.object as? NSWindow {
             windows.removeAll { $0 === window }
             managers.removeValue(forKey: ObjectIdentifier(window))
+            focused.removeValue(forKey: ObjectIdentifier(window))
         }
     }
 }
 
 @MainActor
 private enum PDFWidgetFactory {
+    static func stringValue(_ field: PDFAnnotation) -> String? {
+        // PDFKit's widgetStringValue assumes /V is scalar and can throw an ObjC exception for legal multi-select arrays.
+        if let values = field.value(forAnnotationKey: .widgetValue) as? [String] { return values.joined(separator: ", ") }
+        if field.widgetFieldType == .choice,let value = field.value(forAnnotationKey: .widgetValue) as? String { return value }
+        return field.widgetStringValue
+    }
     static func make(_ tool: PDFTool,bounds: CGRect,name: String,choices: [String]) -> PDFAnnotation {
         let field = PDFAnnotation(bounds: bounds,forType: .widget,withProperties: nil)
         field.fieldName = name; field.color = .white; field.font = NSFont.systemFont(ofSize: 14); field.fontColor = .black
@@ -4446,7 +5331,7 @@ private extension PDFViewer.Coordinator {
             if field.widgetFieldType == .button {
                 if field.buttonWidgetState == .onState { values[name] = field.buttonWidgetStateString }
                 else if values[name] == nil { values[name] = "Off" }
-            } else { values[name] = field.widgetStringValue ?? "" }
+            } else { values[name] = PDFWidgetFactory.stringValue(field) ?? "" }
         } }; return values
     }
     func exportFormData(item: PDFDocumentItem) {
@@ -4461,7 +5346,7 @@ private extension PDFViewer.Coordinator {
                 for index in 0..<item.pageCount { for field in item.document.page(at: index)?.annotations ?? [] where field.type == "Widget" {
                     guard let name = field.fieldName,let value = values[name] else { continue }
                     if field.widgetFieldType == .button { field.buttonWidgetState = field.buttonWidgetStateString == value ? .onState : .offState }
-                    else { field.widgetStringValue = value }
+                    else { AnnotationMetadata.clearFormSelections(field); field.widgetStringValue = value }
                 } }; view.setNeedsDisplay(view.bounds); self.manager.send(.refresh)
             } catch { self.manager.say("Invalid form JSON file","Некорректный JSON-файл формы") }
         }
@@ -4472,7 +5357,7 @@ private extension PDFViewer.Coordinator {
 private extension DocumentManager {
     func snapshot(_ item: PDFDocumentItem) -> PDFDocumentItem.Snapshot? {
         guard let data = try? serializedData(item) else { return nil }
-        return PDFDocumentItem.Snapshot(data: data,page: item.pageIndex,zoom: item.zoom,bookmarks: PDFBookmarkStore.capture(item.document))
+        return PDFDocumentItem.Snapshot(data: data,page: item.pageIndex,zoom: item.zoom,bookmarks: item.canPreserveStreams ? nil : PDFBookmarkStore.capture(item.document))
     }
     func recordUndo(_ item: PDFDocumentItem,group: String) {
         let now = Date()
@@ -4489,10 +5374,12 @@ private extension DocumentManager {
         guard finishSourceEditing?() != false,let item = selected,let current = snapshot(item) else { return }
         guard let state = redo ? item.redoHistory.popLast() : item.undoHistory.popLast(),let document = PDFDocument(data: state.data) else { return }
         if redo { item.undoHistory.append(current) } else { item.redoHistory.append(current) }
-        AnnotationMetadata.restore(document); PDFBookmarkStore.restore(state.bookmarks,on: document)
+        AnnotationMetadata.restore(document)
+        if let bookmarks = state.bookmarks { PDFBookmarkStore.restore(bookmarks,on: document) }
         selectedOutline = nil; selectedAnnotation = nil; selectedContent = nil
         item.navigation.reset(); navigationRevision &+= 1
         item.document = document; item.pageIndex = min(max(0,state.page),document.pageCount-1); item.zoom = state.zoom
+        if state.bookmarks == nil { item.enableStreamPreservation() }
         item.historyGroup = ""; item.historyDate = .distantPast; pageText = String(item.pageIndex+1); send(.refresh)
         seedSerializedData(state.data,item: item)
     }
@@ -4508,19 +5395,62 @@ private extension PDFViewerView {
 
 @MainActor
 private enum PDFDocumentState {
+    private static func combine(_ value: Any,into hash: inout Hasher,depth: Int = 0) {
+        guard depth < 20 else { hash.combine("depth-limit"); return }
+        if let text = value as? String { hash.combine("string"); hash.combine(text) }
+        else if let number = value as? NSNumber { hash.combine(String(cString: number.objCType)); hash.combine(number.stringValue) }
+        else if let data = value as? Data { hash.combine("data"); hash.combine(data) }
+        else if let date = value as? Date { hash.combine("date"); hash.combine(date.timeIntervalSinceReferenceDate) }
+        else if let url = value as? URL { hash.combine("url"); hash.combine(url.absoluteString) }
+        else if let array = value as? [Any] {
+            hash.combine("array"); hash.combine(array.count)
+            for element in array { combine(element,into: &hash,depth: depth+1) }
+        } else if let dictionary = value as? [AnyHashable:Any] {
+            hash.combine("dictionary"); hash.combine(dictionary.count)
+            for key in dictionary.keys.sorted(by: { String(describing: $0) < String(describing: $1) }) {
+                hash.combine(String(describing: key)); combine(dictionary[key]!,into: &hash,depth: depth+1)
+            }
+        } else if let color = value as? NSColor,let rgb = color.usingColorSpace(.deviceRGB) {
+            hash.combine("color"); for component in [rgb.redComponent,rgb.greenComponent,rgb.blueComponent,rgb.alphaComponent] { hash.combine(component) }
+        } else if let path = value as? NSBezierPath {
+            hash.combine("path"); hash.combine(path.elementCount)
+            for index in 0..<path.elementCount {
+                var points = [NSPoint](repeating: .zero,count: 3)
+                let kind = points.withUnsafeMutableBufferPointer { path.element(at: index,associatedPoints: $0.baseAddress!) }
+                hash.combine(kind.rawValue)
+                for point in points { hash.combine(point.x); hash.combine(point.y) }
+            }
+        } else if let boxed = value as? NSValue {
+            let type = String(cString: boxed.objCType); hash.combine(type)
+            if type.contains("CGRect") || type.contains("NSRect") { let rect = boxed.rectValue; for component in [rect.minX,rect.minY,rect.width,rect.height] { hash.combine(component) } }
+            else if type.contains("CGPoint") || type.contains("NSPoint") { hash.combine(boxed.pointValue.x); hash.combine(boxed.pointValue.y) }
+            else if type.contains("CGSize") || type.contains("NSSize") { hash.combine(boxed.sizeValue.width); hash.combine(boxed.sizeValue.height) }
+            else if type.contains("NSRange") { hash.combine(boxed.rangeValue.location); hash.combine(boxed.rangeValue.length) }
+        } else {
+            // PDFKit can recreate opaque wrappers on every read. Their memory
+            // addresses are not document state; editable properties are hashed above.
+            hash.combine(String(reflecting: type(of: value)))
+        }
+    }
     static func rootStamp(_ document: PDFDocument) -> Int {
         var hash = Hasher()
         let attributes: [AnyHashable:Any] = document.documentAttributes ?? [:]
-        for key in attributes.keys.sorted(by: { String(describing: $0) < String(describing: $1) }) { hash.combine(key); hash.combine(String(describing: attributes[key]!)) }
+        for key in attributes.keys.sorted(by: { String(describing: $0) < String(describing: $1) }) { hash.combine(key); combine(attributes[key]!,into: &hash) }
         func visit(_ node: PDFOutline,depth: Int) {
             guard depth < 64 else { return }
-            hash.combine(node.label); hash.combine(node.numberOfChildren)
-            if let destination = node.destination {
+            hash.combine(node.label); hash.combine(node.numberOfChildren); hash.combine(node.isOpen)
+            if let destination = node.destination ?? (node.action as? PDFActionGoTo)?.destination {
                 hash.combine(destination.page.map { document.index(for: $0) }); hash.combine(destination.point.x)
                 hash.combine(destination.point.y); hash.combine(destination.zoom)
             }
             hash.combine(node.action?.type)
             if let action = node.action as? PDFActionURL { hash.combine(action.url?.absoluteString) }
+            if let action = node.action as? PDFActionNamed { hash.combine(action.name.rawValue) }
+            if let action = node.action as? PDFActionRemoteGoTo {
+                hash.combine(action.safeFileURL?.absoluteString); hash.combine(action.pageIndex)
+                hash.combine(action.point.x); hash.combine(action.point.y)
+            }
+            if let action = node.action as? PDFActionResetForm { hash.combine(action.fields); hash.combine(action.fieldsIncludedAreCleared) }
             for index in 0..<node.numberOfChildren { if let child = node.child(at: index) { visit(child,depth: depth+1) } }
         }
         if let root = document.outlineRoot { visit(root,depth: 0) }
@@ -4540,30 +5470,40 @@ private enum PDFDocumentState {
             hash.combine(page.annotations.count)
             for annotation in page.annotations {
                 hash.combine(ObjectIdentifier(annotation)); hash.combine(annotation.contents)
-                hash.combine(annotation.widgetStringValue); hash.combine(annotation.widgetControlType.rawValue)
+                if let ink = AnnotationMetadata.inkCurves(annotation) {
+                    hash.combine("ink-curves"); hash.combine(ink.nodes.count)
+                    for node in ink.nodes { hash.combine(node.kind.rawValue); for p in [node.point,node.control1,node.control2] { hash.combine(p.x); hash.combine(p.y) } }
+                }
+                hash.combine(PDFWidgetFactory.stringValue(annotation)); hash.combine(AnnotationMetadata.formSelections(annotation)); hash.combine(AnnotationMetadata.formRule(annotation)); hash.combine(annotation.widgetControlType.rawValue)
                 hash.combine(annotation.buttonWidgetState.rawValue)
                 for value in [annotation.bounds.minX,annotation.bounds.minY,annotation.bounds.width,annotation.bounds.height] { hash.combine(value) }
                 hash.combine(annotation.color.description); hash.combine(annotation.font?.fontName); hash.combine(annotation.font?.pointSize)
                 hash.combine(annotation.border?.lineWidth)
                 let values = annotation.annotationKeyValues
                 for key in values.keys.sorted(by: { String(describing: $0) < String(describing: $1) }) {
-                    hash.combine(key); hash.combine(String(describing: values[key]!))
+                    hash.combine(key); combine(values[key]!,into: &hash)
                 }
             }
         }
         let attributes: [AnyHashable:Any] = document.documentAttributes ?? [:]
         for key in attributes.keys.sorted(by: { String(describing: $0) < String(describing: $1) }) {
-            hash.combine(key); hash.combine(String(describing: attributes[key]!))
+            hash.combine(key); combine(attributes[key]!,into: &hash)
         }
         func outlines(_ node: PDFOutline,depth: Int) {
             guard depth < 64 else { return }
-            hash.combine(node.label); hash.combine(node.numberOfChildren)
-            if let destination = node.destination {
+            hash.combine(node.label); hash.combine(node.numberOfChildren); hash.combine(node.isOpen)
+            if let destination = node.destination ?? (node.action as? PDFActionGoTo)?.destination {
                 hash.combine(destination.page.map(ObjectIdentifier.init)); hash.combine(destination.point.x)
                 hash.combine(destination.point.y); hash.combine(destination.zoom)
             }
             hash.combine(node.action?.type)
             if let action = node.action as? PDFActionURL { hash.combine(action.url?.absoluteString) }
+            if let action = node.action as? PDFActionNamed { hash.combine(action.name.rawValue) }
+            if let action = node.action as? PDFActionRemoteGoTo {
+                hash.combine(action.safeFileURL?.absoluteString); hash.combine(action.pageIndex)
+                hash.combine(action.point.x); hash.combine(action.point.y)
+            }
+            if let action = node.action as? PDFActionResetForm { hash.combine(action.fields); hash.combine(action.fieldsIncludedAreCleared) }
             for index in 0..<node.numberOfChildren { if let child = node.child(at: index) { outlines(child,depth: depth+1) } }
         }
         if let root = document.outlineRoot { outlines(root,depth: 0) }
@@ -4601,12 +5541,17 @@ private enum PDFDocumentSerializer {
         if !direct { PDFBookmarkStore.restore(bookmarks,on: copy) }
         AnnotationMetadata.prepareForSave(copy)
         defer { if direct { AnnotationMetadata.removeContainers(copy) } }
+        var inkOrigins: [Int:CGPoint] = [:]
+        for index in 0..<copy.pageCount {
+            guard let page = copy.page(at: index),page.annotations.contains(where: { $0.type == "Ink" }) else { continue }
+            let origin = page.bounds(for: .mediaBox).origin; if origin != .zero { inkOrigins[index] = origin }
+        }
         let prepared = Date.timeIntervalSinceReferenceDate
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("BotPlusSnapshot-"+UUID().uuidString+".pdf")
         defer { try? FileManager.default.removeItem(at: url) }
         guard copy.write(to: url,withOptions: [PDFDocumentWriteOption.saveTextFromOCROption:false]) else { throw PDFSourceError.save }
         let written = Date.timeIntervalSinceReferenceDate
-        let data = try PDFSourceSession.validEmptyPageStreams(Data(contentsOf: url))
+        let data = try PDFDocumentExtras.repairWrittenInk(PDFSourceSession.validEmptyPageStreams(Data(contentsOf: url)),originalOrigins: inkOrigins)
         if trace { print(String(format: "PERF serializer copy %.2f ms; write %.2f ms; normalize %.2f ms",(prepared-started)*1000,(written-prepared)*1000,(Date.timeIntervalSinceReferenceDate-written)*1000)); fflush(nil) }
         return data
     }
@@ -4621,6 +5566,7 @@ private enum PDFBookmarkStore {
         let zoom: CGFloat
         let action: PDFAction?
         let children: [Record]
+        var isOpen: Bool? = nil
     }
     static func capture(_ document: PDFDocument) -> [Record]? {
         guard let root = document.outlineRoot else { return nil }
@@ -4628,9 +5574,10 @@ private enum PDFBookmarkStore {
             guard depth < 64 else { return [] }
             return (0..<parent.numberOfChildren).compactMap { index in
                 guard let node = parent.child(at: index) else { return nil }
-                let candidate = node.destination?.page.map { document.index(for: $0) }
+                let destination = node.destination ?? (node.action as? PDFActionGoTo)?.destination
+                let candidate = destination?.page.map { document.index(for: $0) }
                 let page = candidate.flatMap { $0 >= 0 && $0 < document.pageCount ? $0 : nil }
-                return Record(title: node.label ?? "",page: page,point: node.destination?.point ?? .zero,zoom: node.destination?.zoom ?? 0,action: page == nil ? node.action?.copy() as? PDFAction : nil,children: children(node,depth: depth+1))
+                return Record(title: node.label ?? "",page: page,point: destination?.point ?? .zero,zoom: destination?.zoom ?? 0,action: page == nil ? node.action?.copy() as? PDFAction : nil,children: children(node,depth: depth+1),isOpen: node.isOpen)
             }
         }
         return children(root,depth: 0)
@@ -4641,6 +5588,7 @@ private enum PDFBookmarkStore {
         @MainActor func append(_ records: [Record],to parent: PDFOutline) {
             for record in records {
                 let node = PDFOutline(); node.label = record.title
+                node.isOpen = record.isOpen ?? false
                 if let index = record.page,let page = document.page(at: index) { let destination = PDFDestination(page: page,at: record.point); destination.zoom = record.zoom; node.destination = destination }
                 else { node.action = record.action }
                 append(record.children,to: node); parent.insertChild(node,at: parent.numberOfChildren)
@@ -5255,7 +6203,19 @@ private extension PDFViewer.Coordinator {
             return nil
         }
         guard options.opacity.isFinite, (0...1).contains(options.opacity) else { return error("Invalid opacity.", "Некорректная непрозрачность.") }
+        if kind == .watermark {
+            guard options.angle.isFinite,abs(options.angle) <= 360,options.fontSize.isFinite,(4...200).contains(options.fontSize) else { return error("Invalid angle or font size.","Проверьте угол и размер шрифта.") }
+            do {
+                let layer = try PDFWatermarkLayer.data(document: item.document,indices: indices,options: options,filename: item.filename,russian: russian)
+                let output = try PDFDocumentExtras.overlay(sourceData(item),layer: layer,indices: indices,markName: "BotPlusWatermark_v2",remove: remove)
+                try installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil)
+                item.enableStreamPreservation()
+                for index in indices { if let page = item.document.page(at: index) { for annotation in page.annotations where AnnotationMetadata.decoration(of: annotation) == "watermark" { page.removeAnnotation(annotation) } } }
+                manager.send(.refresh); return nil
+            } catch let failure { return failure.localizedDescription }
+        }
         if kind == .background {
+            guard options.tileWidth.isFinite,(1...14400).contains(options.tileWidth) else { return error("Invalid tile width.","Проверьте ширину плитки.") }
             let document = item.document, stamp = PDFDocumentState.stamp(document)
             let color = PDFColorComponents(options.color, opacity: options.opacity)
             let operationID = UUID()
@@ -5269,7 +6229,7 @@ private extension PDFViewer.Coordinator {
                     let data = try self.sourceData(item)
                     let progressOwner = self.manager
                     let result = try await PDFPageBackgroundEngine.change(data: data, indices: indices, color: color,
-                        image: options.image, remove: remove) { [weak progressOwner] value in
+                        image: options.image, placement: options.backgroundMode,tileWidth: options.tileWidth, remove: remove) { [weak progressOwner] value in
                             if progressOwner?.activeOperationID == operationID { progressOwner?.operationProgress = value }
                         }
                     try Task.checkCancellation()
@@ -5288,6 +6248,9 @@ private extension PDFViewer.Coordinator {
                           && options.batesStart >= 0 && options.batesStart <= 1_000_000_000
                           && (1...12).contains(options.batesDigits)) else {
             return error("Font size: 4–200 pt; Bates start: 0–1000000000; digits: 1–12.", "Размер шрифта: 4–200 pt; начало Бейтса: 0–1000000000; цифр: 1–12.")
+        }
+        if kind == .header && !remove {
+            guard indices.allSatisfy({ index in item.document.page(at: index).map { PDFDecorationEngine.validHeader(options,box: $0.bounds(for: .cropBox)) } ?? false }) else { return error("Header/footer insets and text rows must fit every selected page.","Отступы и строки колонтитулов должны помещаться на каждой выбранной странице.") }
         }
         manager.recordUndo(item, group: "decoration-" + kind.rawValue)
         for (sequence, index) in indices.enumerated() {
@@ -5571,11 +6534,1938 @@ private extension PDFViewer.Coordinator {
                 let preview = try await Task.detached(priority: .utility) { try PDFSnapshotRenderer.preview(png) }.value
                 try Task.checkCancellation()
                 manager.snapshotPNG = png; manager.snapshotImage = NSImage(data: preview)
+                manager.snapshotSource = (item.id,index,region)
                 // A newer Copy action wins if rendering takes time.
                 guard NSPasteboard.general.changeCount == clipboardRevision else { return }
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setData(png,forType: .png); manager.refreshClipboard()
             } catch is CancellationError { }
             catch { manager.say("Cannot capture the region. Reduce DPI or select a smaller area.","Не удалось создать снимок. Уменьшите DPI или выделенную область.") }
         }
+    }
+}
+
+// MARK: Workspace feature integration (implementation stage)
+@MainActor private extension PDFViewer.Coordinator {
+    func performAdditionalFeature(_ id: String,on view: PDFViewerView,item: PDFDocumentItem) -> Bool {
+        if id == "annotationScale" { showAnnotationScale(item: item,view: view); return true }
+        if id == "annotationRotate" { showAnnotationRotation(item: item,view: view); return true }
+        if id == "annotationFlip:horizontal" || id == "annotationFlip:vertical" {
+            if !view.flipAnnotationSelection(horizontal: id.hasSuffix("horizontal")) { manager.say("Select unlocked Line, Ink, Square or Circle annotations without measurements. The result must fit the page.","Выберите незаблокированные Line, Ink, Square или Circle без измерений. Результат должен помещаться на странице.") }; return true
+        }
+        if id == "annotationRotate:left" || id == "annotationRotate:right" {
+            if !view.rotateAnnotationSelection(clockwise: id.hasSuffix("right")) { manager.say("Select unlocked Line, Ink, Square or Circle annotations without measurements. The rotated group must fit the page.","Выберите незаблокированные Line, Ink, Square или Circle без измерений. После поворота группа должна помещаться на странице.") }; return true
+        }
+        if id.hasPrefix("annotationBatch") {
+            let parts = id.split(separator: ":"); guard parts.count == 2,["annotationBatchLock","annotationBatchVisible","annotationBatchPrint"].contains(String(parts[0])),let value = Int(parts[1]),[0,1].contains(value),let first = view.selectedAnnotations.first,let page = first.page,page.document === item.document else { return true }
+            let selection = view.selectedAnnotations
+            let permissions = selection.allSatisfy { $0.page === page && (["Widget","Link"].contains($0.type ?? "") ? item.document.allowsDocumentChanges : item.document.allowsCommenting) }
+            guard permissions,parts[0] == "annotationBatchLock" || view.canModifyAnnotationSelection else { return true }
+            manager.recordUndo(item,group: "annotationBatchFlags-"+UUID().uuidString)
+            for annotation in selection {
+                switch parts[0] { case "annotationBatchLock": AnnotationMetadata.setLocked(value == 1,on: annotation); case "annotationBatchVisible": annotation.shouldDisplay = value == 1; case "annotationBatchPrint": annotation.shouldPrint = value == 1; default: break }
+            }
+            view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
+        }
+        if id == "selectAllAnnotations" {
+            if let page = view.currentPage { manager.tool = .selectComments; view.selectAnnotations(page.annotations.filter { $0.shouldDisplay && $0.type != "Widget" && $0.type != "Popup" && !AnnotationMetadata.isContainer($0) }) }; return true
+        }
+        if id == "manageLayerPresets" { showLayerPresetEditor(item: item,view: view); return true }
+        if id == "layerOrderEditor" { showLayerOrderEditor(item: item,view: view); return true }
+        if id == "layerRadioEditor" { showLayerRadioEditor(item: item,view: view); return true }
+        if id == "layerStateEditor" { showLayerStateEditor(item: item,view: view); return true }
+        if id == "xObjectConditionEditor" { showXObjectConditionEditor(item: item,view: view); return true }
+        if id == "formResourceTransform" { showFormResourceTransform(item: item,view: view); return true }
+        if id.hasPrefix("measurementAxis:"),let axis = EngineeringDistanceAxis(rawValue: String(id.dropFirst("measurementAxis:".count))),let ink = view.selectedAnnotation {
+            if axis == .custom { showMeasurementDirection(ink,item: item,view: view); return true }
+            if !setMeasurementAxis(ink,axis: axis,item: item,view: view) { manager.say("Check measurement parts, locks and page bounds.","Проверьте состав измерения, блокировки и границы страницы.") }; return true
+        }
+        if id == "membershipBindingEditor" { showMembershipBindingEditor(item: item,view: view); return true }
+        if id == "membershipEditor" { showMembershipEditor(item: item,view: view); return true }
+        if id == "layersRefresh" || id.hasPrefix("layerToggle:") || id.hasPrefix("layerLock:") || id.hasPrefix("layerPreset:") { layerCommand(id,item: item,view: view); return true }
+        if id.hasPrefix("layerPolicy:") { showLayerPolicy(id,item: item,view: view); return true }
+        if id.hasPrefix("annotationSelect:") {
+            let parts = id.split(separator: ":").compactMap { Int($0) }
+            if parts.count == 2,let page = item.document.page(at: parts[0]),page.annotations.indices.contains(parts[1]) {
+                view.go(to: page); view.selectAnnotation(page.annotations[parts[1]]); manager.panels.select(.properties); manager.refreshPresentation()
+            }; return true
+        }
+        if id.hasPrefix("pages-") { performPageBatch(id,on: view,item: item); return true }
+        if id.hasPrefix("attachment") { attachmentCommand(id,on: view,item: item); return true }
+        switch id {
+        case "namedDestinations": showNamedDestinations(item: item,view: view)
+        case "formOrder": showFormOrder(item: item,view: view)
+        case "tabTraversal": showTabTraversal(item: item,view: view)
+        case "formValues": showFormValues(item: item,view: view)
+        case "formRule": showFormRule(item: item)
+        case "validateForm": validateForm(item: item)
+        case "annotationVertices": showAnnotationVertices(item: item,view: view)
+        case "bookmarkNamed","bookmarkDestination": namedBookmarks(item: item,view: view,convertToNames: id == "bookmarkNamed")
+        case "bookmarkFromPageText","bookmarkFromTOC": showHeadingBookmarks(item: item,view: view,fromTOC: id == "bookmarkFromTOC")
+        case "check","order","alt": showStructure(item: item,view: view)
+        case "word","excel","powerpoint": showOfficeExport(item: item,format: id)
+        case "compare": showComparison(item: item)
+        case "colors","enhance": showRasterWorkflow(item: item,view: view,enhancement: id == "enhance")
+        case "ocr": showOCR(item: item,view: view)
+        case "protect","password": showSecurity(item: item)
+        case "exportXFDF": exportXFDF(item: item,comments: false)
+        case "importXFDF": importXFDF(item: item,view: view,comments: false)
+        case "importFDF": importFDF(item: item,view: view)
+        case "exportFDF": exportFDF(item: item)
+        case "exportCommentsXFDF": exportXFDF(item: item,comments: true)
+        case "importCommentsFDF": importCommentsFDF(item: item,view: view)
+        case "exportCommentsFDF": exportCommentsFDF(item: item)
+        case "importCommentsXFDF": importXFDF(item: item,view: view,comments: true)
+        case "measureRefresh": view.updateEngineeringMeasurement(); manager.send(.refresh)
+        case "distance": manager.tool = .distance; manager.panels.select(.properties); manager.refreshPresentation()
+        case "perimeter": manager.tool = .perimeter; manager.panels.select(.properties); manager.refreshPresentation()
+        case "area": manager.tool = .area; manager.panels.select(.properties); manager.refreshPresentation()
+        case "scale": manager.tool = .calibration; manager.panels.select(.properties); manager.refreshPresentation()
+        case "measurementScale": showEngineeringScale(item: item,view: view)
+        case "measurementTransform": showEngineeringTransform(item: item,view: view)
+        case "measurementLabel": if let ink = view.selectedAnnotation { showMeasurementLabel(ink,item: item,view: view) }
+        case "measurementTransfer": showEngineeringTransfer(item: item,view: view)
+        case "measurementCopyDocument": showEngineeringDocumentCopy(item: item,view: view)
+        case "crop","resize": showGeometry(crop: id == "crop",item: item,view: view)
+        case "spell": showSpelling(item: item,view: view)
+        case "bookmarkJSON": exportBookmarkTree(item)
+        case "bookmarkFromFile": importBookmarkTree(item,view: view)
+        case "bookmarkHTML": exportBookmarkHTML(item)
+        case "snapshotRegion": showSnapshotRegion(item: item)
+        case "snapshotAgain": if let source = manager.snapshotSource,source.id == item.id,let page = item.document.page(at: source.page) { copySnapshot(page: page,region: source.region) }
+        case "snapshotObject":
+            if let annotation = view.selectedAnnotation,let page = annotation.page { copySnapshot(page: page,region: annotation.bounds) }
+            else if let selected = view.contentSelection { copySnapshot(page: selected.page,region: selected.object.bounds) }
+        case "snapshotPrint":
+            guard let png = manager.snapshotPNG,let image = NSImage(data: png),let page = PDFPage(image: image) else { return true }
+            let document = PDFDocument(); document.insert(page,at: 0)
+            showAdvancedPrint(document: document,current: 0,selected: [0])
+        default: return false
+        }
+        return true
+    }
+    func attachmentCommand(_ id: String,on view: PDFViewerView,item: PDFDocumentItem) {
+        do {
+            let data = try manager.serializedData(item)
+            if id == "attachmentRefresh" { manager.attachments = try PDFDocumentExtras.attachments(data); manager.attachmentError = nil; return }
+            if id == "attachmentAdd" {
+                guard item.document.allowsDocumentChanges else { return }
+                PDFDialogs.open([.data]) { [weak self,weak view] urls in
+                    guard let self,let view,item.document === view.document,let url = urls.first else { return }
+                    let lease = FileAccessLease(url); defer { _ = lease }
+                    do {
+                        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                        guard size <= 256*1024*1024 else { throw PDFSourceError.content }
+                        let bytes = try PDFDocumentExtras.changeAttachment(self.manager.serializedData(item),name: url.lastPathComponent,file: Data(contentsOf: url))
+                        try self.installSourceData(bytes,item: item,index: item.pageIndex,view: view,bounds: nil)
+                        item.enableStreamPreservation(); self.manager.attachments = try PDFDocumentExtras.attachments(bytes)
+                    } catch { self.manager.say("Cannot add attachment.","Не удалось добавить вложение.") }
+                }
+            } else if id.hasPrefix("attachmentDelete:"),let index = Int(id.split(separator: ":").last ?? ""),item.document.allowsDocumentChanges {
+                let bytes = try PDFDocumentExtras.changeAttachment(data,delete: index)
+                try installSourceData(bytes,item: item,index: item.pageIndex,view: view,bounds: nil); item.enableStreamPreservation()
+                manager.attachments = try PDFDocumentExtras.attachments(bytes)
+            } else if (id.hasPrefix("attachmentExtract:") || id.hasPrefix("attachmentOpen:")),let index = Int(id.split(separator: ":").last ?? ""),item.document.allowsCopying {
+                let entries = try PDFDocumentExtras.attachments(data),file = try PDFDocumentExtras.attachment(data,index: index)
+                let name = entries.first { $0.index == index }?.name ?? "Attachment.bin"
+                PDFAttachmentExport.save(file,name: name,openAfterSaving: id.hasPrefix("attachmentOpen:"),russian: manager.language == .ru) { [weak manager] message in
+                    if let message { manager?.notice = message }
+                }
+            }
+        } catch { manager.attachmentError = manager.language == .ru ? "Не удалось прочитать дерево вложений PDF." : "Cannot read the PDF attachment tree." }
+    }
+    func showGeometry(crop: Bool,item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges else { return }
+        let document = item.document,selected = item.selectedPages.sorted()
+        let request = PageGeometryRequest(document: document,index: item.pageIndex,crop: crop,russian: manager.language == .ru,initialRange: selected.isEmpty ? "all" : "selected") { [weak self,weak view] options in
+            guard let self,let view,view.document === document,item.document === document else { return "Документ изменился / Document changed" }
+            let indices = options.range == "selected" ? selected : PDFPageRange.parse(options.range,count: item.pageCount) ?? []
+            guard !indices.isEmpty else { return "Диапазон: all, selected или 1-3,5 / Use all, selected or 1-3,5" }
+            let f = options.unit.factor
+            do {
+                if crop {
+                    let margins = [options.left,options.right,options.top,options.bottom]
+                    guard margins.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return "Проверьте отступы / Invalid margins" }
+                    var boxes: [(PDFPage,CGRect)] = []
+                    for index in indices {
+                        guard let page = document.page(at: index) else { throw PDFSourceError.page }
+                        let box = page.bounds(for: .mediaBox)
+                        let next = CGRect(x: box.minX+options.left*f,y: box.minY+options.bottom*f,width: box.width-(options.left+options.right)*f,height: box.height-(options.top+options.bottom)*f)
+                        guard next.width > 1,next.height > 1 else { return "Рамка должна оставаться внутри страницы / Crop must remain inside the page" }; boxes.append((page,next))
+                    }
+                    self.manager.recordUndo(item,group: "cropPages"); for (page,box) in boxes { page.setBounds(box,for: .cropBox) }
+                    self.reload(view,document: item,pageIndex: item.pageIndex); self.manager.send(.refresh)
+                } else {
+                    let bytes = try PDFDocumentExtras.resize(self.manager.serializedData(item),indices: indices,width: options.width*f,height: options.height*f,scale: options.scaleContent)
+                    // Preserve bookmark target coordinates when their pages scale.
+                    let records = self.manager.bookmarkNodes().enumerated().compactMap { offset,node -> (Int,Int,CGPoint,CGFloat)? in
+                        guard let d = node.destination,let p = d.page else { return nil }; return (offset,document.index(for: p),d.point,d.zoom)
+                    }
+                    let oldBoxes = Dictionary(uniqueKeysWithValues: indices.compactMap { index in document.page(at: index).map { (index,$0.bounds(for: .mediaBox)) } })
+                    try self.installSourceData(bytes,item: item,index: item.pageIndex,view: view,bounds: nil)
+                    let newNodes = self.manager.bookmarkNodes()
+                    for record in records where record.0 < newNodes.count {
+                        guard let page = item.document.page(at: record.1) else { continue }
+                        var point = record.2
+                        if options.scaleContent,let box = oldBoxes[record.1] { point = CGPoint(x: (point.x-box.minX)*options.width*f/box.width,y: (point.y-box.minY)*options.height*f/box.height) }
+                        let d = PDFDestination(page: page,at: point); d.zoom = record.3; newNodes[record.0].destination = d
+                    }
+                    if options.scaleContent {
+                        for pageIndex in 0..<item.pageCount { for annotation in item.document.page(at: pageIndex)?.annotations ?? [] {
+                            guard let action = annotation.action as? PDFActionGoTo,let target = action.destination.page else { continue }
+                            let index = item.document.index(for: target)
+                            guard let box = oldBoxes[index] else { continue }
+                            let old = action.destination, point = CGPoint(x: (old.point.x-box.minX)*options.width*f/box.width,y: (old.point.y-box.minY)*options.height*f/box.height)
+                            let next = PDFDestination(page: target,at: point); next.zoom = old.zoom; annotation.action = PDFActionGoTo(destination: next)
+                        } }
+                    }
+                    item.enableStreamPreservation(); self.manager.send(.refresh)
+                }
+                return nil
+            } catch { return "Не удалось изменить геометрию страниц / Page geometry change failed" }
+        }
+        manager.geometryRequest = request
+    }
+    func showSpelling(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsCopying,manager.operationTask == nil else { return }
+        let prefix = manager.language == .ru ? "ru" : "en",checker = NSSpellChecker.shared
+        let languages = checker.availableLanguages.sorted()
+        guard let language = languages.first(where: { $0 == prefix }) ?? languages.first(where: { $0.replacingOccurrences(of: "-",with: "_").hasPrefix(prefix+"_") }) else {
+            manager.say("Install this spelling language in macOS.","Установите словарь этого языка в macOS."); return
+        }
+        let expected = item.document,operationID = UUID()
+        manager.activeOperationID = operationID; manager.operationProgress = 0
+        manager.operationTitle = manager.language == .ru ? "Проверка орфографии" : "Checking spelling"
+        manager.operationTask = Task { @MainActor [weak self,weak view] in
+            guard let self else { return }
+            defer { self.manager.activeOperationID = nil; self.manager.operationTask = nil; self.manager.operationProgress = nil }
+            let tag = NSSpellChecker.uniqueSpellDocumentTag(); defer { checker.closeSpellDocument(withTag: tag) }
+            do {
+                await Task.yield()
+                let data = try self.manager.serializedData(item)
+                var issues: [PDFSpellIssue] = []
+                try await PDFSourceTextReader.enumeratePages(data: data) { index,text,count in
+                    let string = text as NSString; var position = 0
+                    while position < string.length && issues.count < 2000 {
+                        let range = checker.checkSpelling(of: text,startingAt: position,language: language,wrap: false,inSpellDocumentWithTag: tag,wordCount: nil)
+                        guard range.location != NSNotFound,range.length > 0,range.location >= position,NSMaxRange(range) <= string.length else { break }
+                        let word = string.substring(with: range)
+                        let guesses = checker.guesses(forWordRange: range,in: text,language: language,inSpellDocumentWithTag: tag) ?? []
+                        issues.append(PDFSpellIssue(page: index,word: word,suggestions: Array(guesses.prefix(8)))); position = NSMaxRange(range)
+                    }
+                    self.manager.operationProgress = Double(index+1)/Double(max(1,count))
+                    return issues.count < 2000
+                }
+                try Task.checkCancellation()
+                guard let view,item.document === expected,self.manager.selected?.id == item.id else { return }
+                self.manager.spellRequest = PDFSpellRequest(issues: issues,russian: self.manager.language == .ru) { [weak self,weak view] issue in
+                    DispatchQueue.main.async {
+                        guard let self,let view,item.document === expected,view.document === expected else { return }
+                        self.manager.navigate(to: issue.page); self.manager.searchText = issue.word; self.manager.searchRequestID &+= 1
+                        self.manager.tool = .editText; self.manager.refreshPresentation()
+                    }
+                }
+            } catch is CancellationError {} catch { self.sourceError(error) }
+        }
+    }
+    func importBookmarkTree(_ item: PDFDocumentItem,view: PDFViewerView) {
+        PDFDialogs.open([.plainText,.json]) { [weak self,weak view] urls in
+            guard let self,let view,item.document === view.document,let url = urls.first else { return }
+            let lease = FileAccessLease(url); defer { _ = lease }
+            do {
+                let data = try Data(contentsOf: url); guard data.count <= 16*1024*1024 else { throw PDFSourceError.content }
+                let records: [PDFBookmarkExchange]
+                if url.pathExtension.lowercased() == "json" { records = try JSONDecoder().decode([PDFBookmarkExchange].self,from: data) }
+                else {
+                    guard let text = String(data: data,encoding: .utf8) ?? String(data: data,encoding: .utf16) ?? String(data: data,encoding: .windowsCP1251) else { throw PDFSourceError.content }
+                    records = PDFBookmarkExchange.plain(text,count: item.pageCount)
+                }
+                guard records.allSatisfy({ $0.valid(pageCount: item.pageCount) }) else { throw PDFSourceError.content }
+                try self.applyBookmarkExchange(records,item: item,view: view)
+            } catch { self.manager.say("Cannot import bookmark hierarchy.","Не удалось импортировать дерево закладок.") }
+        }
+    }
+    func applyBookmarkExchange(_ records: [PDFBookmarkExchange],item: PDFDocumentItem,view: PDFViewerView) throws {
+        guard item.document === view.document,item.document.allowsDocumentChanges,finishSourceEditor() else { throw PDFSourceError.permission }
+        let source = try manager.serializedData(item)
+        let output = try PDFDocumentExtras.appendBookmarkExchange(source,records: records)
+        try installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false)
+        item.enableStreamPreservation(); manager.panels.select(.bookmarks); manager.send(.refresh)
+    }
+    func exportBookmarkTree(_ item: PDFDocumentItem) {
+        guard item.document.outlineRoot != nil,finishSourceEditor() else { return }
+        do {
+            let records = try PDFDocumentExtras.bookmarkExchange(manager.serializedData(item))
+            let bytes = try JSONEncoder().encode(records)
+            PDFDialogs.save("Bookmarks.json",type: .json) { [weak manager] url in do { try bytes.write(to: url,options: .atomic) } catch { manager?.say("Export failed","Ошибка экспорта") } }
+        } catch { manager.say("Some bookmark actions or destinations cannot be exported losslessly.","Некоторые действия или назначения закладок нельзя экспортировать без потери данных.") }
+    }
+    func exportBookmarkHTML(_ item: PDFDocumentItem) {
+        guard let root = item.document.outlineRoot else { return }
+        let records = (0..<root.numberOfChildren).compactMap { root.child(at: $0).map { PDFBookmarkExchange.read($0,document: item.document) } }
+        let content = "<!doctype html><html><meta charset=\"utf-8\"><title>Bookmarks</title><body><ul>"+records.map { $0.html(pdf: item.url.lastPathComponent.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "document.pdf") }.joined()+"</ul></body></html>"
+        PDFDialogs.save("Bookmarks.html",type: .html) { [weak manager] url in do { try content.write(to: url,atomically: true,encoding: .utf8) } catch { manager?.say("Export failed","Ошибка экспорта") } }
+    }
+    func showAdvancedPrint(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsPrinting else { return }; showAdvancedPrint(document: item.document,current: item.pageIndex,selected: item.selectedPages.sorted())
+    }
+    func showAdvancedPrint(document: PDFDocument,current: Int,selected: [Int]) {
+        manager.printRequest = PDFPrintRequest(document: document,current: current,selected: selected,russian: manager.language == .ru) { [weak self] options,indices in
+            self?.manager.afterFeatureDismiss = { [weak self] in self?.runAdvancedPrint(document: document,indices: indices,options: options) }
+        }
+    }
+    func runAdvancedPrint(document: PDFDocument,indices: [Int],options: PDFPrintOptions) {
+        let copy = PDFDocument()
+        for index in indices { if let original = document.page(at: index),let page = original.copy() as? PDFPage {
+            for annotation in page.annotations { annotation.shouldDisplay = options.annotations && annotation.shouldPrint }
+            copy.insert(page,at: copy.pageCount)
+        } }
+        guard copy.pageCount > 0 else { return }
+        let size = options.paperSize
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo; info.paperSize = size
+        let margin = options.marginPoints
+        info.leftMargin = margin; info.rightMargin = margin; info.topMargin = margin; info.bottomMargin = margin
+        info.scalingFactor = 1; info.isHorizontallyCentered = false; info.isVerticallyCentered = false
+        info.dictionary()[NSPrintInfo.AttributeKey.copies] = options.copies
+        info.dictionary()[NSPrintInfo.AttributeKey.mustCollate] = options.collate
+        let area = CGSize(width: max(1,size.width-2*margin),height: max(1,size.height-2*margin))
+        for index in 0..<copy.pageCount { if let page = copy.page(at: index) {
+            let box = page.bounds(for: .cropBox),rotated = page.rotation%180 != 0
+            let width = rotated ? box.height : box.width,height = rotated ? box.width : box.height
+            _ = width; _ = height // Auto-rotation is computed from the final driver paper size while drawing.
+            if options.raster && box.width*box.height*pow(CGFloat(options.dpi)/72,2) > 40_000_000 { manager.say("Reduce print image DPI for this page size.","Уменьшите DPI растровой печати для этого размера страницы."); return }
+        } }
+        let canvas = PDFPrintCanvas(document: copy,options: options,area: area)
+        let operation = NSPrintOperation(view: canvas,printInfo: info); operation.showsPrintPanel = true; operation.showsProgressPanel = true
+        operation.printPanel.options.formUnion([.showsCopies,.showsPageRange,.showsPaperSize,.showsOrientation,.showsPreview])
+        operation.run()
+    }
+}
+
+@MainActor private extension DocumentManager {
+    var thumbnailPages: [Int] { guard let item = selected else { return [] }; let values = item.selectedPages.filter { $0 >= 0 && $0 < item.pageCount }.sorted(); return values.isEmpty ? [item.pageIndex] : values }
+    func canThumbnailCommand(_ action: String, selectionCount: Int? = nil) -> Bool {
+        guard let item = selected, item.pageCount > 0 else { return false }
+        let document = item.document
+        let assembly = document.allowsDocumentAssembly || document.allowsDocumentChanges
+        switch action {
+        case "selectAll", "selectNone": return true
+        case "copy", "extract", "new", "exportImages": return document.allowsCopying
+        case "cut": return assembly && document.allowsCopying && (selectionCount ?? thumbnailPages.count) < item.pageCount
+        case "delete": return assembly && (selectionCount ?? thumbnailPages.count) < item.pageCount
+        case "duplicate": return assembly && document.allowsCopying
+        case "paste": return assembly && NSPasteboard.general.availableType(from: [ObjectClipboard.pages, .pdf]) != nil
+        case "print": return document.allowsPrinting
+        case "rotateLeft", "rotateRight", "crop", "insert", "replace", "blankBefore", "blankAfter": return assembly
+        default: return false
+        }
+    }
+    func thumbnailCommand(_ action: String,index: Int) {
+        guard let item = selected, canThumbnailCommand(action) else { return }
+        if !item.selectedPages.contains(index) { item.selectedPages = [index]; item.thumbnailAnchor = index }
+        if action == "insert" || action == "replace" { send(.feature(action)); return }
+        if action == "blankBefore" || action == "blankAfter" { send(.blankPageAt(index + (action == "blankAfter" ? 1 : 0))); return }
+        send(.feature("pages-"+action))
+    }
+}
+@MainActor private extension PDFViewer.Coordinator {
+    func performPageBatch(_ id: String,on view: PDFViewerView,item: PDFDocumentItem) {
+        let indices = manager.thumbnailPages, action = String(id.dropFirst(6)), document = item.document
+        guard !indices.isEmpty,indices.allSatisfy({ $0 >= 0 && $0 < item.pageCount }) else { return }
+        if action.hasPrefix("drop:") {
+            let fields = action.split(separator: ":")
+            guard fields.count == 5,let sourceID = UUID(uuidString: String(fields[1])),let destination = Int(fields[3]),let revision = Int(fields[4]),(0...item.pageCount).contains(destination),let sourceOwner = DocumentManager.workspaceManagers.first(where: { $0.documents.contains { $0.id == sourceID } }),let source = sourceOwner.documents.first(where: { $0.id == sourceID }),source.store.revision == revision,sourceOwner.finishSourceEditing?() != false,source.store.revision == revision else { return }
+            let pages = Array(Set(fields[2].split(separator: ",").compactMap { Int($0) })).sorted()
+            guard !pages.isEmpty,pages.allSatisfy({ $0 >= 0 && $0 < source.pageCount }) else { return }
+            if source.store === item.store { item.selectedPages = Set(pages); performPageBatch("pages-move:\(destination)",on: view,item: item); return }
+            guard source.document.allowsCopying,item.document.allowsDocumentAssembly || item.document.allowsDocumentChanges else { return }
+            do {
+                let data = try PDFSubsetBuilder.build(source.document,indices: pages),board = NSPasteboard.withUniqueName()
+                defer { board.releaseGlobally() }
+                board.setData(data,forType: ObjectClipboard.pages); manager.recordUndo(item,group: "pageDrop")
+                pastePages(destination,item: item,view: view,board: board); item.selectedPages = Set(destination..<(destination+pages.count))
+            } catch { sourceError(error) }; return
+        }
+        if action == "selectAll" { item.selectedPages = Set(0..<item.pageCount); manager.refreshPresentation(); return }
+        if action == "selectNone" { item.selectedPages = []; manager.refreshPresentation(); return }
+        if ["copy","cut","extract","new","exportImages"].contains(action) && !document.allowsCopying { return }
+        if action == "copy" || action == "cut" || action == "new" {
+            do {
+                let data = try PDFSubsetBuilder.build(document,indices: indices)
+                if action == "new",let copy = PDFDocument(data: data) {
+                    AnnotationMetadata.restore(copy)
+                    let entry = PDFDocumentItem(url: FileManager.default.temporaryDirectory.appendingPathComponent("Selected.pdf"),document: copy,preserveStreams: true); entry.isUntitled = true; entry.recoveredFilename = "Selected-"+item.filename
+                    manager.insertDocument(entry); manager.seedSerializedData(data,item: entry); return
+                }
+                let board = NSPasteboard.general; board.clearContents(); board.setData(data,forType: ObjectClipboard.pages); board.setData(data,forType: .pdf)
+                if action == "copy" { return }
+            } catch { sourceError(error); return }
+        }
+        if action == "extract" { choosePageExport(item: item,expected: document,groups: [indices],split: false); return }
+        if action == "print" { showAdvancedPrint(document: document,current: item.pageIndex,selected: indices); return }
+        if action == "crop" { showGeometry(crop: true,item: item,view: view); return }
+        if action == "exportImages" { showFormatting("images",item: item,view: view); return }
+        guard document.allowsDocumentAssembly || document.allowsDocumentChanges, finishSourceEditor() else { return }
+        if action == "delete" || action == "cut" {
+            guard indices.count < item.pageCount else { manager.say("At least one page must remain.","В документе должна остаться хотя бы одна страница."); return }
+            let removed = Set(indices.compactMap { document.page(at: $0).map(ObjectIdentifier.init) })
+            manager.recordUndo(item,group: "pageBatchDelete")
+            for node in manager.bookmarkNodes() { if let page = node.destination?.page,removed.contains(ObjectIdentifier(page)) { node.destination = nil; node.action = nil } }
+            for index in 0..<document.pageCount { for link in document.page(at: index)?.annotations ?? [] {
+                if let destination = (link.action as? PDFActionGoTo)?.destination,let page = destination.page,removed.contains(ObjectIdentifier(page)) { link.action = nil; link.destination = nil }
+            } }
+            for index in indices.reversed() { document.removePage(at: index) }
+            item.pageIndex = min(indices[0],item.pageCount-1); item.selectedPages = [item.pageIndex]
+        } else if action == "duplicate" {
+            let copies = indices.compactMap { index -> PDFPage? in guard let source = document.page(at: index),let copy = source.copy() as? PDFPage else { return nil }; AnnotationMetadata.copy(from: source,to: copy); return copy }
+            guard copies.count == indices.count else { return }
+            manager.recordUndo(item,group: "pageBatchDuplicate")
+            let at = indices.last!+1
+            for (offset,page) in copies.enumerated() { document.insert(page,at: at+offset) }; item.selectedPages = Set(at..<(at+copies.count)); item.pageIndex = at
+        } else if action == "rotateLeft" || action == "rotateRight" {
+            manager.recordUndo(item,group: "pageBatchRotate")
+            for index in indices { if let page = document.page(at: index) { page.rotation = (page.rotation+(action == "rotateLeft" ? 270 : 90))%360 } }
+        } else if action == "paste" {
+            manager.recordUndo(item,group: "pageBatchPaste"); pastePages((indices.last ?? item.pageIndex)+1,item: item,view: view); return
+        } else if action.hasPrefix("move:"),let destination = Int(action.dropFirst(5)) {
+            guard (0...item.pageCount).contains(destination) else { return }
+            let selected = Set(indices), remaining = Array(0..<item.pageCount).filter { !selected.contains($0) }
+            let offset = min(remaining.count,max(0,destination-indices.filter { $0 < destination }.count))
+            var order = remaining; order.insert(contentsOf: indices,at: offset)
+            guard order != Array(0..<item.pageCount) else { return }
+            manager.recordUndo(item,group: "pageBatchMove")
+            var current = Array(0..<item.pageCount), positions = Dictionary(uniqueKeysWithValues: current.enumerated().map { ($0.element,$0.offset) })
+            for i in order.indices where current[i] != order[i] {
+                guard let j = positions[order[i]] else { return }
+                document.exchangePage(at: i,withPageAt: j); current.swapAt(i,j); positions[current[i]] = i; positions[current[j]] = j
+            }
+            item.selectedPages = Set(offset..<(offset+indices.count)); item.pageIndex = offset
+        } else { return }
+        item.navigation.reset(); manager.navigationRevision &+= 1
+        reload(view,document: item,pageIndex: item.pageIndex); manager.pageText = String(item.pageIndex+1); manager.send(.refresh)
+    }
+}
+
+private struct WorkspaceSheets: ViewModifier {
+    @ObservedObject var manager: DocumentManager
+    func body(content: Content) -> some View {
+        content
+        .sheet(item: $manager.pageWorkflowRequest, onDismiss: { let action = manager.afterPageWorkflowDismiss; manager.afterPageWorkflowDismiss = nil; DispatchQueue.main.async { action?() } }) { PDFPageWorkflowEditor(request: $0) }
+        .sheet(item: $manager.graphicMarkRequest) { PDFGraphicMarkEditor(request: $0) }
+        .sheet(item: $manager.formattingRequest) { PDFFormattingEditor(request: $0) }
+        .sheet(isPresented: $manager.isAboutPresented) { AboutDialog(manager: manager) }
+        .sheet(isPresented: $manager.isLicensePresented) { LicenseDialog(manager: manager) }
+        .sheet(isPresented: $manager.isUpdatePresented) { UpdateDialog(manager: manager) }
+        .sheet(isPresented: $manager.isRibbonCustomizationPresented) {
+            RibbonCustomizationView(tabs: RibbonTab.allCases.map { tab in
+                RibbonCatalogTab(id: String(describing: tab),title: manager.text(tab.title),groups: RibbonView.groups(for: tab).map { group in
+                    RibbonCatalogTab.Group(id: group.id,title: manager.text(group.title),commands: group.commands.map { RibbonCatalogTab.Command(id: $0.id,title: manager.text($0.title)) })
+                })
+            },russian: manager.language == .ru,close: { manager.isRibbonCustomizationPresented = false }).preferredColorScheme(manager.theme.colorScheme)
+        }
+        .sheet(item: $manager.regionRequest) { PDFRegionEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.geometryRequest) { PageGeometryEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.printRequest,onDismiss: { let action = manager.afterFeatureDismiss; manager.afterFeatureDismiss = nil; DispatchQueue.main.async { action?() } }) { PDFPrintEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.namedRequest) { PDFNamedEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.layerPresetRequest) { PDFLayerPresetEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.layerStateRequest) { PDFLayerStateEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.layerRadioRequest) { PDFLayerRadioEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.layerOrderRequest) { PDFLayerOrderEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.pathRequest) { PDFPathEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.structureRequest) { PDFStructurePanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.officeRequest,onDismiss: { let action = manager.afterFeatureDismiss; manager.afterFeatureDismiss = nil; DispatchQueue.main.async { action?() } }) { PDFOfficePanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.comparisonRequest) { PDFComparisonPanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.rasterRequest) { PDFRasterEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.scannerRequest) { PDFScannerPanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.headingRequest) { PDFHeadingEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.bookmarkTextRequest) { PDFBookmarkTextEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.bookmarkValidationRequest) { PDFBookmarkValidationPanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.tocRequest) { PDFTOCEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.tabTraversalRequest) { PDFTabTraversalEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.formOrderRequest) { PDFFormOrderEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.engineeringScaleRequest) { EngineeringScaleEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.annotationScaleRequest) { PDFAnnotationScaleEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.annotationRotationRequest) { PDFAnnotationRotationEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.annotationVertexRequest) { PDFAnnotationVertexEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.formValuesRequest) { PDFFormValuesEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.formRuleRequest) { PDFFormRuleEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.formValidationRequest) { PDFFormValidationPanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.ocrReviewRequest) { PDFOCRReviewPanel(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.layerPolicyRequest) { PDFLayerPolicyEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.membershipRequest) { PDFMembershipEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.membershipBindingRequest) { PDFMembershipBindingEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.xObjectConditionRequest) { PDFXObjectConditionEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.formResourceTransformRequest) { PDFFormResourceTransformEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.engineeringTransformRequest) { EngineeringTransformEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.engineeringTransferRequest) { EngineeringTransferEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.engineeringDirectionRequest) { EngineeringDirectionEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.engineeringLabelRequest) { EngineeringLabelEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.securityRequest,onDismiss: { let action = manager.afterFeatureDismiss; manager.afterFeatureDismiss = nil; DispatchQueue.main.async { action?() } }) { PDFSecurityEditor(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(item: $manager.spellRequest) { PDFSpellResults(request: $0).preferredColorScheme(manager.theme.colorScheme) }
+        .sheet(isPresented: $manager.isSpacingPresented) {
+            VStack(alignment: .leading,spacing: 20) {
+                Text(manager.language == .ru ? "Расстояние между страницами" : "Page spacing").font(.title2)
+                HStack { Slider(value: $manager.pageGap,in: 0...40,step: 1); Text("\(Int(manager.pageGap)) pt").monospacedDigit().frame(width: 55) }
+                Text(manager.language == .ru ? "Сохраняется для новых окон. Масштаб PDF и размеры страниц не изменяются." : "Saved for new windows. PDF zoom and page sizes stay unchanged.").font(.caption)
+                HStack { Button(manager.language == .ru ? "Сбросить" : "Reset") { manager.pageGap = 4 }; Spacer(); Button(manager.language == .ru ? "Готово" : "Done") { manager.isSpacingPresented = false } }
+            }.padding(24).frame(width: 450).preferredColorScheme(manager.theme.colorScheme)
+        }
+        .alert(manager.language == .ru ? "Сообщение" : "Notice", isPresented: Binding(
+            get: { manager.notice != nil }, set: { if !$0 { manager.notice = nil } }
+        )) {
+            Button(manager.language == .ru ? "OK" : "OK", role: .cancel) { manager.notice = nil }
+        } message: { Text(manager.notice ?? "") }
+    }
+}
+
+private struct ActivePanelBody: View {
+    let panel: WorkspacePanel
+    @ObservedObject var manager: DocumentManager
+    var body: some View { PanelBody(panel: panel,manager: manager.activePane) }
+}
+@MainActor private extension DocumentManager {
+    static var workspaceManagers: [DocumentManager] {
+        let root = (NSApp.delegate as? BotPlusAppDelegate)?.manager
+        let values = (root.map { [$0]+($0.splitManager.map { [$0] } ?? []) } ?? []) + PDFWindowPool.shared.allManagers
+        var seen = Set<ObjectIdentifier>(); return values.filter { seen.insert(ObjectIdentifier($0)).inserted }
+    }
+    func moveTab(_ id: UUID,before target: UUID) {
+        guard let owner = (Self.workspaceManagers+[self]).first(where: { $0.documents.contains { $0.id == id } }),let entry = owner.documents.first(where: { $0.id == id }),owner.finishSourceEditing?() != false,let destination = documents.firstIndex(where: { $0.id == target }) else { return }
+        if owner === self {
+            guard let from = documents.firstIndex(where: { $0.id == id }),from != destination else { return }
+            documents.remove(at: from); documents.insert(entry,at: min(destination-(from < destination ? 1 : 0),documents.count))
+        } else {
+            owner.documents.removeAll { $0.id == id }; if owner.selectedID == id { owner.selectedID = owner.documents.last?.id; owner.refreshPresentation() }
+            documents.insert(entry,at: min(destination,documents.count)); select(id)
+        }
+    }
+    func duplicateView(_ id: UUID,detached: Bool = false) {
+        guard finishSourceEditing?() != false,let source = documents.first(where: { $0.id == id }) else { return }
+        let item = PDFDocumentItem(shared: source.store,page: source.pageIndex,zoom: source.zoom)
+        if detached { PDFWindowPool.shared.open(item: item) } else { insertDocument(item) }
+    }
+    func detachTab(_ id: UUID) {
+        guard finishSourceEditing?() != false,let item = documents.first(where: { $0.id == id }) else { return }
+        documents.removeAll { $0.id == id }; if selectedID == id { selectedID = documents.last?.id; refreshPresentation() }
+        PDFWindowPool.shared.open(item: item)
+    }
+    func splitView(_ id: UUID,horizontal: Bool) {
+        guard finishSourceEditing?() != false,let source = documents.first(where: { $0.id == id }) else { return }
+        if splitManager == nil {
+            let child = DocumentManager(recent: recent,panels: panels); child.parentManager = self
+            child.language = language; child.theme = theme; child.layout = layout; child.rulersVisible = rulersVisible
+            child.insertDocument(PDFDocumentItem(shared: source.store,page: source.pageIndex,zoom: source.zoom))
+            splitManager = child
+        } else { splitManager?.insertDocument(PDFDocumentItem(shared: source.store,page: source.pageIndex,zoom: source.zoom)) }
+        splitHorizontal = horizontal
+    }
+    func closeSplit() {
+        guard let child = splitManager,child.finishSourceEditing?() != false else { return }
+        // Keep documents opened only in the second pane when closing the split.
+        for item in child.documents where !documents.contains(where: { $0.store === item.store }) { documents.append(item) }
+        PDFWindowPool.shared.clearFocus(child); splitFocused = false; splitManager = nil
+    }
+    func closeTabs(_ ids: [UUID]) {
+        guard !isClosingTabs,let window = NSApp.keyWindow,window.attachedSheet == nil else { return }
+        let closing = Set(ids),stores = Set(documents.filter { closing.contains($0.id) }.map { $0.store.id })
+        // Commit drafts in every view of the affected documents before checking dirtiness.
+        let owners = (Self.workspaceManagers+[self]).filter { manager in manager.documents.contains { stores.contains($0.store.id) } }
+        guard owners.allSatisfy({ $0.operationTask == nil && $0.loadingFiles == 0 && $0.finishSourceEditing?() != false }) else { return }
+        let dirty = documentsRequiringSaveForClosing(ids,managers: Self.workspaceManagers+[self])
+        guard !dirty.isEmpty else { for id in ids { close(id) }; return }
+        isClosingTabs = true
+        let alert = NSAlert(); alert.messageText = language == .ru ? "Сохранить изменения перед закрытием вкладок?" : "Save changes before closing tabs?"
+        alert.informativeText = dirty.map(\.filename).joined(separator: "\n")
+        alert.addButton(withTitle: language == .ru ? "Сохранить всё и закрыть" : "Save all and close")
+        alert.addButton(withTitle: language == .ru ? "Отмена" : "Cancel")
+        alert.addButton(withTitle: language == .ru ? "Закрыть без сохранения" : "Close without saving")
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+        alert.beginSheetModal(for: window) { [weak self] response in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if response == .alertFirstButtonReturn {
+                    self.saveDocumentsForClosing(dirty) { [weak self] saved in
+                        guard let self else { return }; self.isClosingTabs = false
+                        // Recheck after asynchronous Save As panels: another view may have changed.
+                        if saved { self.closeTabs(ids) }
+                    }
+                } else {
+                    self.isClosingTabs = false
+                    if response == .alertThirdButtonReturn { for id in ids { self.close(id) } }
+                }
+            }
+        }
+    }
+    func documentsRequiringSaveForClosing(_ ids: [UUID],managers: [DocumentManager]) -> [PDFDocumentItem] {
+        let closing = Set(ids)
+        let retained = managers.flatMap(\.documents).filter { !closing.contains($0.id) }
+        var seen = Set<UUID>()
+        return documents.filter { item in
+            closing.contains(item.id) && item.store.hasChanges &&
+            !retained.contains(where: { $0.store === item.store }) && seen.insert(item.store.id).inserted
+        }
+    }
+    func saveForClosing(_ item: PDFDocumentItem,to url: URL) throws {
+        try PDFDocumentSerializer.write(try serializedData(item),to: url)
+        item.url = url; item.isUntitled = false
+        item.store.savedRevision = item.store.revision; item.store.savedStamp = PDFDocumentState.stamp(item.document)
+        recent.remember(url); refreshPresentation()
+    }
+    func saveDocumentsForClosing(_ items: [PDFDocumentItem],completion: @escaping (Bool) -> Void) {
+        guard let item = items.first else { completion(true); return }
+        let remaining = Array(items.dropFirst())
+        let save: (URL) -> Void = { [weak self] url in
+            guard let self else { completion(false); return }
+            let owners = (Self.workspaceManagers+[self]).filter { $0.documents.contains { $0.store === item.store } }
+            guard owners.allSatisfy({ $0.operationTask == nil && $0.finishSourceEditing?() != false }) else { completion(false); return }
+            do { try self.saveForClosing(item,to: url); self.saveDocumentsForClosing(remaining,completion: completion) }
+            catch { self.say("Could not save \(item.filename). Tabs remain open.","Не удалось сохранить \(item.filename). Вкладки остаются открытыми."); completion(false) }
+        }
+        guard item.isUntitled else { save(item.url); return }
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.pdf]; panel.nameFieldStringValue = item.filename
+        panel.begin { response in
+            DispatchQueue.main.async {
+                guard response == .OK,let url = panel.url else { completion(false); return }
+                save(url)
+            }
+        }
+    }
+}
+
+@MainActor private extension PDFViewerView {
+    func finishEngineering() {
+        guard let draft = engineeringDraft,draft.points.count >= (draft.kind == .area ? 3 : 2) else { return }
+        engineeringDraft = nil; refreshOverlay(); onEngineeringCommit?(draft.page,draft.kind,draft.points)
+    }
+}
+@MainActor private extension PDFViewer.Coordinator {
+    func showMembershipEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),configuration = try PDFDocumentExtras.membershipConfiguration(data)
+            let document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.membershipRequest = PDFMembershipRequest(russian: manager.language == .ru,editable: document.allowsDocumentChanges,configuration: configuration,create: { [weak self,weak view] name,members,policy,expression in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён или запрещает изменения / Document changed or disallows changes" }
+                do {
+                    let output = try PDFDocumentExtras.createMembership(data,name: name,members: members,policy: policy,expression: expression)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Проверьте уникальное название, группы и выражение / Check unique name, groups and expression" }
+            },apply: { [weak self,weak view] entry,members,policy,expression in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён или запрещает изменения / Document changed or disallows changes" }
+                do {
+                    let output = try PDFDocumentExtras.setMembership(data,entry: entry,members: members,policy: policy,expression: expression)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Проверьте группы, политику и выражение And/Or/Not / Check groups, policy and And/Or/Not expression" }
+            })
+        } catch { manager.say("Cannot read OCMD conditions in this PDF.","Не удалось прочитать условия OCMD в этом PDF.") }
+    }
+    func showMembershipBindingEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,item.document.allowsDocumentChanges,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),configuration = try PDFDocumentExtras.membershipConfiguration(data),document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.membershipBindingRequest = PDFMembershipBindingRequest(russian: manager.language == .ru,pageCount: item.pageCount,currentPage: item.pageIndex,selectedPages: item.selectedPages.sorted(),entries: configuration.entries,apply: { [weak self,weak view] condition,pages in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён или запрещает изменения / Document changed or disallows changes" }
+                do {
+                    let output = try PDFDocumentExtras.bindMembershipPages(data,entry: condition,indices: pages)
+                    if output == data { return nil }
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Не удалось назначить условие. Проверьте диапазон, баланс marked content и целостность прежнего назначения / Check page range, marked-content balance and integrity of previous assignment" }
+            })
+        } catch { manager.say("Cannot read page visibility conditions.","Не удалось прочитать условия видимости страниц.") }
+    }
+    func showFormResourceTransform(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,item.document.allowsDocumentChanges,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),targets = try PDFDocumentExtras.xObjectConditionTargets(data,pageIndex: item.pageIndex).filter { $0.kind == "Form" },document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.formResourceTransformRequest = PDFFormResourceTransformRequest(russian: manager.language == .ru,pageIndex: item.pageIndex,targets: targets,apply: { [weak self,weak view] target,options in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён или запрещает изменения / Document changed or disallows changes" }
+                do {
+                    let output = try PDFDocumentExtras.transformFormResource(data,target: target,options: options)
+                    if output == data { return nil }
+                    try self.installSourceData(output,item: item,index: target.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Проверьте Form, матрицу и актуальность пути ресурсов / Check Form, matrix and resource path" }
+            })
+        } catch { manager.say("Cannot read Form resources.","Не удалось прочитать ресурсы Form.") }
+    }
+    func showXObjectConditionEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,item.document.allowsDocumentChanges,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),conditions = try PDFDocumentExtras.membershipConfiguration(data),targets = try PDFDocumentExtras.xObjectConditionTargets(data,pageIndex: item.pageIndex),document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.xObjectConditionRequest = PDFXObjectConditionRequest(russian: manager.language == .ru,pageIndex: item.pageIndex,targets: targets,entries: conditions.entries,apply: { [weak self,weak view] target,condition in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён или запрещает изменения / Document changed or disallows changes" }
+                do {
+                    let output = try PDFDocumentExtras.bindXObjectCondition(data,target: target,entry: condition)
+                    if output == data { return nil }
+                    try self.installSourceData(output,item: item,index: target.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Объект изменён или имеет неподдерживаемое условие/структуру / Object changed or has unsupported condition/structure" }
+            })
+        } catch { manager.say("Cannot read XObject visibility resources.","Не удалось прочитать ресурсы видимости XObject.") }
+    }
+    func commitEngineering(page: PDFPage,kind: EngineeringKind,points: [CGPoint],view: PDFViewerView) {
+        guard let item = manager.selected,item.document === view.document,item.document.allowsCommenting else { return }
+        let prefix = "BotPlus engineering calibration v1:"
+        if kind == .calibration {
+            let length = hypot(points[1].x-points[0].x,points[1].y-points[0].y)
+            guard length > 0 else { return }
+            PDFDialogs.prompt(manager.language == .ru ? "Калибровка текущей страницы" : "Calibrate current page",fields: [("Реальная длина, мм / Real length, mm","1000")]) { [weak self,weak view] values in
+                guard let self,let view,item.document === view.document,let real = Double(values[0].replacingOccurrences(of: ",",with: ".")),real.isFinite,real > 0 else { return }
+                let scale = EngineeringScale(millimetersPerPoint: real/length,unit: self.manager.engineeringUnit)
+                guard scale.valid,let data = try? JSONEncoder().encode(scale) else { return }
+                self.manager.recordUndo(item,group: "engineeringScale")
+                for marker in page.annotations where (marker.contents ?? "").hasPrefix(prefix) { page.removeAnnotation(marker) }
+                let marker = PDFAnnotation(bounds: CGRect(x: page.bounds(for: .cropBox).minX,y: page.bounds(for: .cropBox).minY,width: 1,height: 1),forType: .freeText,withProperties: nil)
+                marker.contents = prefix+data.base64EncodedString(); marker.shouldDisplay = false; marker.shouldPrint = false; page.addAnnotation(marker)
+                self.manager.tool = .distance; self.manager.send(.refresh)
+            }; return
+        }
+        var scale = EngineeringScale(unit: manager.engineeringUnit)
+        if let marker = page.annotations.first(where: { ($0.contents ?? "").hasPrefix(prefix) }),let text = marker.contents,let data = Data(base64Encoded: String(text.dropFirst(prefix.count))),let saved = try? JSONDecoder().decode(EngineeringScale.self,from: data),saved.valid { scale.millimetersPerPoint = saved.millimetersPerPoint }
+        let measurement = EngineeringMeasure(kind: kind,points: points,scale: scale,dimensionOffset: kind == .distance ? 12 : nil)
+        guard measurement.value.isFinite else { return }
+        manager.recordUndo(item,group: "engineeringMeasure")
+        let minX = points.map(\.x).min()!,minY = points.map(\.y).min()!,maxX = points.map(\.x).max()!,maxY = points.map(\.y).max()!
+        let bounds = CGRect(x: minX-2,y: minY-2,width: max(4,maxX-minX+4),height: max(4,maxY-minY+4))
+        let ink = PDFAnnotation(bounds: bounds,forType: .ink,withProperties: nil),path = NSBezierPath(),group = UUID().uuidString
+        for (i,point) in points.enumerated() { let p = CGPoint(x: point.x-bounds.minX,y: point.y-bounds.minY); if i == 0 { path.move(to: p) } else { path.line(to: p) } }
+        if kind == .area { path.close() }; ink.add(path); ink.color = view.strokeColor
+        let border = PDFBorder(); border.lineWidth = view.strokeWidth; ink.border = border; ink.contents = measurement.label(russian: manager.language == .ru)
+        AnnotationMetadata.setGroup(group,on: ink); AnnotationMetadata.setMeasurement(measurement,on: ink); AnnotationMetadata.setOpacity(manager.annotationOpacity,on: ink)
+        let label = PDFAnnotation(bounds: CGRect(x: bounds.midX-70,y: bounds.maxY+4,width: 140,height: 24),forType: .freeText,withProperties: nil)
+        label.contents = ink.contents; label.font = .systemFont(ofSize: 12); label.fontColor = ink.color; label.color = .clear; label.alignment = .center
+        AnnotationMetadata.setGroup(group,on: label); page.addAnnotation(ink); page.addAnnotation(label)
+        EngineeringDimensionRenderer.update(annotation: ink,measurement: measurement)
+        view.selectAnnotation(ink); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh)
+    }
+}
+
+@MainActor private enum EngineeringDimensionRenderer {
+    static func update(annotation: PDFAnnotation,measurement: EngineeringMeasure) {
+        guard let page = annotation.page,let group = AnnotationMetadata.group(of: annotation),measurement.validLabelPlacement else { return }
+        for part in page.annotations where AnnotationMetadata.group(of: part) == group && AnnotationMetadata.decoration(of: part) == "engineeringDimension" { page.removeAnnotation(part) }
+        func line(_ start: CGPoint,_ end: CGPoint,arrows: Bool) {
+            let box = CGRect(x: min(start.x,end.x)-4,y: min(start.y,end.y)-4,width: max(1,abs(end.x-start.x))+8,height: max(1,abs(end.y-start.y))+8)
+            let part = PDFAnnotation(bounds: box,forType: .line,withProperties: nil)
+            part.startPoint = CGPoint(x: start.x-box.minX,y: start.y-box.minY); part.endPoint = CGPoint(x: end.x-box.minX,y: end.y-box.minY)
+            part.color = annotation.color; let border = PDFBorder(); border.lineWidth = max(0.5,annotation.border?.lineWidth ?? 1); part.border = border
+            if arrows { part.startLineStyle = .closedArrow; part.endLineStyle = .closedArrow }
+            part.shouldDisplay = annotation.shouldDisplay; part.shouldPrint = annotation.shouldPrint
+            AnnotationMetadata.setGroup(group,on: part); AnnotationMetadata.setDecoration("engineeringDimension",on: part)
+            AnnotationMetadata.setOpacity(Double(AnnotationMetadata.alpha(of: annotation)),on: part)
+            AnnotationMetadata.setLocked(AnnotationMetadata.isLocked(annotation),on: part); page.addAnnotation(part)
+        }
+        if measurement.kind == .perimeter || measurement.kind == .area {
+            guard let origin = measurement.contourLeaderMidpoint else { return }
+            let anchor: CGPoint
+            switch measurement.effectiveLeaderAnchor {
+            case .midpoint: anchor = origin
+            case .dimensionStart,.measuredStart: anchor = measurement.points.first!
+            case .dimensionEnd,.measuredEnd: anchor = measurement.points.last!
+            }
+            for label in page.annotations where label.type == "FreeText" && AnnotationMetadata.group(of: label) == group {
+                let displacement = measurement.labelOffset ?? .zero
+                label.bounds = CGRect(x: annotation.bounds.midX-70+displacement.x,y: annotation.bounds.maxY+4+displacement.y,width: 140,height: 24)
+                label.contents = annotation.contents
+                let route = measurement.labelLeaderPoints(midpoint: origin,labelBounds: label.bounds,anchor: anchor)
+                for (start,end) in zip(route,route.dropFirst()) where hypot(end.x-start.x,end.y-start.y) > 0.000001 { line(start,end,arrows: false) }
+            }
+            return
+        }
+        guard measurement.kind == .distance,measurement.points.count == 2,let offset = measurement.dimensionOffset,offset.isFinite else { return }
+        guard let (baseA,baseB) = measurement.dimensionBaseline else { return }
+        let a = measurement.points[0],b = measurement.points[1],length = hypot(baseB.x-baseA.x,baseB.y-baseA.y)
+        guard length > 0.000001 else { return }
+        let nx = -(baseB.y-baseA.y)/length,ny = (baseB.x-baseA.x)/length
+        let p = CGPoint(x: baseA.x+nx*offset,y: baseA.y+ny*offset),q = CGPoint(x: baseB.x+nx*offset,y: baseB.y+ny*offset)
+        line(p,q,arrows: true)
+        let extensionOffset = offset+(offset >= 0 ? 4 : -4)
+        line(a,CGPoint(x: baseA.x+nx*extensionOffset,y: baseA.y+ny*extensionOffset),arrows: false)
+        line(b,CGPoint(x: baseB.x+nx*extensionOffset,y: baseB.y+ny*extensionOffset),arrows: false)
+        for label in page.annotations where label.type == "FreeText" && AnnotationMetadata.group(of: label) == group {
+            let displacement = measurement.labelOffset ?? .zero
+            label.bounds = CGRect(x: (p.x+q.x)/2-70+displacement.x,y: (p.y+q.y)/2+4+displacement.y,width: 140,height: 24)
+            label.contents = annotation.contents
+            let route = measurement.labelLeaderPoints(midpoint: CGPoint(x: (p.x+q.x)/2,y: (p.y+q.y)/2),labelBounds: label.bounds,anchor: measurement.leaderAnchorPoint(dimensionStart: p,dimensionEnd: q))
+            for (start,end) in zip(route,route.dropFirst()) where hypot(end.x-start.x,end.y-start.y) > 0.000001 { line(start,end,arrows: false) }
+        }
+    }
+}
+@MainActor private extension PDFViewerView {
+    func updateEngineeringMeasurement() {
+        guard let ink = selectedAnnotation,let page = ink.page,var measure = AnnotationMetadata.measurement(ink),let path = ink.paths?.first else { return }
+        var points: [CGPoint] = []
+        for index in 0..<path.elementCount {
+            var buffer = [NSPoint](repeating: .zero,count: 3)
+            let type = buffer.withUnsafeMutableBufferPointer { path.element(at: index,associatedPoints: $0.baseAddress!) }
+            if type == .moveTo || type == .lineTo || type == .cubicCurveTo {
+                let point = buffer[type == .cubicCurveTo ? 2 : 0]; points.append(CGPoint(x: ink.bounds.minX+point.x,y: ink.bounds.minY+point.y))
+            }
+        }
+        guard points.count >= 2 else { return }; measure.points = points
+        AnnotationMetadata.setMeasurement(measure,on: ink)
+        let text = measure.label(russian: Locale.current.language.languageCode?.identifier == "ru")
+        ink.contents = text
+        if let group = AnnotationMetadata.group(of: ink) {
+            for label in page.annotations where label !== ink && label.type == "FreeText" && AnnotationMetadata.group(of: label) == group {
+                label.contents = text; label.fontColor = ink.color
+                label.bounds = CGRect(x: ink.bounds.midX-70,y: ink.bounds.maxY+4,width: 140,height: 24)
+            }
+        }
+        EngineeringDimensionRenderer.update(annotation: ink,measurement: measure)
+        refreshOverlay(); setNeedsDisplay(bounds)
+    }
+}
+
+@MainActor private extension DocumentManager {
+    func recordFieldChange() { if let selected { recordUndo(selected,group: "formProperties") } }
+}
+@MainActor private extension PDFViewer.Coordinator {
+    func showSecurity(item: PDFDocumentItem) {
+        guard !item.document.isEncrypted || item.document.permissionsStatus == .owner else { manager.say("Open with the owner password to change security.","Для изменения защиты откройте документ с паролем владельца."); return }
+        manager.securityRequest = PDFSecurityRequest(russian: manager.language == .ru) { [weak self] options in
+            self?.manager.afterFeatureDismiss = { [weak self] in
+                guard let self else { return }
+                let panel = NSSavePanel(); panel.allowedContentTypes = [.pdf]; panel.nameFieldStringValue = "Protected-"+item.filename
+                panel.begin { response in
+                    guard response == .OK,let url = panel.url else { return }
+                    DispatchQueue.main.async {
+                        do {
+                            guard url.standardizedFileURL != item.url.standardizedFileURL else { throw PDFSourceError.permission }
+                            let bytes = try self.manager.serializedData(item)
+                            guard let copy = PDFDocument(data: bytes) else { throw PDFSourceError.document }
+                            var permissions: UInt = 0
+                            if options.printing { permissions |= 3 }; if options.copying { permissions |= 1<<4 }; if options.changes { permissions |= 1<<2 }; if options.assembly { permissions |= 1<<3 }; if options.comments { permissions |= 1<<6 }; if options.forms { permissions |= 1<<7 }; if options.accessibility { permissions |= 1<<5 }
+                            let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString+".pdf"); defer { try? FileManager.default.removeItem(at: temp) }
+                            guard copy.write(to: temp,withOptions: [.ownerPasswordOption: options.owner,.userPasswordOption: options.user,.accessPermissionsOption: NSNumber(value: permissions),.saveTextFromOCROption: false]),let encrypted = PDFDocument(url: temp),encrypted.isEncrypted,encrypted.unlock(withPassword: options.owner) else { throw PDFSourceError.save }
+                            try PDFDocumentSerializer.write(Data(contentsOf: temp),to: url)
+                        } catch { self.manager.say("Could not export encrypted PDF; the original is intact.","Не удалось сохранить защищённый PDF. Исходный файл не изменён.") }
+                    }
+                }
+            }
+        }
+    }
+    func exportXFDF(item: PDFDocumentItem,comments: Bool) {
+        let data = comments ? PDFXFDF.comments(item.document,include: { !AnnotationMetadata.isContainer($0) },opacity: { Double(AnnotationMetadata.alpha(of: $0)) }) : PDFXFDF.forms(fdfValues(item))
+        let panel = NSSavePanel(); panel.nameFieldStringValue = comments ? "Comments.xfdf" : "FormData.xfdf"; panel.allowedContentTypes = [UTType(filenameExtension: "xfdf") ?? .xml]
+        panel.begin { [weak manager] response in guard response == .OK,let url = panel.url else { return }; DispatchQueue.main.async { do { try data.write(to: url,options: .atomic) } catch { manager?.say("Export failed","Ошибка экспорта") } } }
+    }
+    func fdfValues(_ item: PDFDocumentItem) -> [String:PDFFDF.FieldValue] {
+        var values: [String:PDFFDF.FieldValue] = [:]
+        for index in 0..<item.pageCount { for field in item.document.page(at: index)?.annotations ?? [] where field.type == "Widget" {
+            guard let name = field.fieldName else { continue }
+            if field.widgetFieldType == .button {
+                if field.widgetControlType == .pushButtonControl { continue }
+                if field.buttonWidgetState == .onState { values[name] = .name(field.buttonWidgetStateString) }
+                else if values[name] == nil { values[name] = .name("Off") }
+            } else if let selected = AnnotationMetadata.formSelections(field) ?? (field.value(forAnnotationKey: .widgetValue) as? [String]) { values[name] = .array(selected) }
+            else { values[name] = .text(PDFWidgetFactory.stringValue(field) ?? "") }
+        } }
+        return values
+    }
+    func exportCommentsFDF(item: PDFDocumentItem) {
+        guard item.document.allowsCopying else { return }
+        do {
+            let xml = PDFXFDF.comments(item.document,include: { !AnnotationMetadata.isContainer($0) },opacity: { Double(AnnotationMetadata.alpha(of: $0)) })
+            let entries = try PDFXFDF.read(xml).comments
+            guard !entries.isEmpty else { manager.say("No supported comments to export.","Нет поддерживаемых комментариев для экспорта."); return }
+            let data = try PDFFDF.writeComments(entries)
+            PDFDialogs.save("Comments.fdf",type: UTType(filenameExtension: "fdf") ?? .data) { [weak manager] url in
+                do { try data.write(to: url,options: .atomic) } catch { manager?.say("Export failed","Ошибка экспорта") }
+            }
+        } catch { manager.say("Cannot export these comments as FDF.","Не удалось экспортировать эти комментарии в FDF.") }
+    }
+    @discardableResult func applyExchangedComments(_ entries: [PDFXFDF.Comment],item: PDFDocumentItem,view: PDFViewerView) -> Bool {
+        guard view.document === item.document,!entries.isEmpty,entries.count <= 50000 else { return false }
+        var plans: [(PDFPage,PDFAnnotation)] = []
+        for entry in entries {
+            guard let (index,annotation) = PDFXFDF.annotation(entry),let page = item.document.page(at: index),annotation.type == "Link" ? item.document.allowsDocumentChanges : item.document.allowsCommenting else { return false }
+            plans.append((page,annotation))
+        }
+        guard manager.snapshot(item) != nil else { return false }
+        manager.recordUndo(item,group: "importComments-"+UUID().uuidString)
+        for (page,annotation) in plans {
+            page.addAnnotation(annotation)
+            AnnotationMetadata.setOpacity(Double((annotation.type == "FreeText" ? annotation.fontColor ?? .black : annotation.color).alphaComponent),on: annotation)
+        }
+        view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
+    }
+    func importCommentsFDF(item: PDFDocumentItem,view: PDFViewerView) {
+        let document = item.document,stamp = PDFDocumentState.stamp(document)
+        PDFDialogs.open([UTType(filenameExtension: "fdf") ?? .data]) { [weak self,weak view] urls in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,let url = urls.first else { return }
+            let lease = FileAccessLease(url); defer { _ = lease }
+            do {
+                let parsed = try PDFFDF.readComments(Data(contentsOf: url))
+                guard self.applyExchangedComments(parsed.entries,item: item,view: view) else { throw PDFSourceError.content }
+                if parsed.unsupported > 0 { self.manager.say("Imported supported comments; skipped unsupported types: \(parsed.unsupported).","Поддерживаемые комментарии импортированы; пропущено неподдерживаемых типов: \(parsed.unsupported).") }
+            } catch { self.manager.say("Cannot import FDF comments. Check page numbers, geometry, permissions and supported types.","Не удалось импортировать комментарии FDF. Проверьте номера страниц, геометрию, разрешения и поддерживаемые типы.") }
+        }
+    }
+    func exportFDF(item: PDFDocumentItem) {
+        guard item.document.allowsCopying else { return }
+        let bytes = PDFFDF.write(fdfValues(item))
+        PDFDialogs.save("FormData.fdf",type: UTType(filenameExtension: "fdf") ?? .data) { [weak manager] url in
+            do { try bytes.write(to: url,options: .atomic) } catch { manager?.say("Export failed","Ошибка экспорта") }
+        }
+    }
+    func applyFDF(_ values: [String:PDFFDF.FieldValue],item: PDFDocumentItem) -> Bool {
+        guard item.document.allowsFormFieldEntry,manager.snapshot(item) != nil else { return false }
+        let fields = (0..<item.pageCount).flatMap { item.document.page(at: $0)?.annotations ?? [] }.filter { $0.type == "Widget" && !$0.isReadOnly && values[$0.fieldName ?? ""] != nil }
+        guard !fields.isEmpty,fields.allSatisfy({ field in
+            if case .array? = values[field.fieldName ?? ""] { return field.widgetFieldType == .choice }
+            if let rule = AnnotationMetadata.formRule(field),let value = values[field.fieldName ?? ""]?.strings.first {
+                let candidate = field.maximumLength > 0 ? String(value.prefix(field.maximumLength)) : value
+                return rule.issue(candidate,russian: manager.language == .ru) == nil
+            }
+            return true
+        }) else { return false }
+        manager.recordUndo(item,group: "importFDF-"+UUID().uuidString)
+        for field in fields {
+            guard let value = values[field.fieldName ?? ""] else { continue }
+            if field.widgetFieldType == .button {
+                if field.widgetControlType != .pushButtonControl { field.buttonWidgetState = value.strings.first == field.buttonWidgetStateString ? .onState : .offState }
+            } else if case .array(let selected) = value {
+                AnnotationMetadata.setFormSelections(selected,on: field)
+            } else {
+                let text = value.strings.first ?? ""
+                AnnotationMetadata.clearFormSelections(field)
+                field.widgetStringValue = field.maximumLength > 0 ? String(text.prefix(field.maximumLength)) : text
+            }
+        }
+        manager.send(.refresh); return true
+    }
+    func importFDF(item: PDFDocumentItem,view: PDFViewerView) {
+        let document = item.document
+        PDFDialogs.open([UTType(filenameExtension: "fdf") ?? .data]) { [weak self,weak view] urls in
+            guard let self,let view,item.document === document,view.document === document,let url = urls.first else { return }
+            let lease = FileAccessLease(url); defer { _ = lease }
+            do {
+                let values = try PDFFDF.read(Data(contentsOf: url))
+                guard self.applyFDF(values,item: item) else { throw PDFSourceError.content }; view.setNeedsDisplay(view.bounds)
+            } catch { self.manager.say("Cannot import FDF form data. Check field names and permissions.","Не удалось импортировать FDF. Проверьте имена полей и разрешения.") }
+        }
+    }
+    func importXFDF(item: PDFDocumentItem,view: PDFViewerView,comments: Bool) {
+        PDFDialogs.open([UTType(filenameExtension: "xfdf") ?? .xml,.xml]) { [weak self,weak view] urls in
+            guard let self,let view,item.document === view.document,let url = urls.first else { return }
+            let lease = FileAccessLease(url); defer { _ = lease }
+            do {
+                let parsed = try PDFXFDF.read(Data(contentsOf: url))
+                if !comments {
+                    let values = parsed.multipleValues.mapValues { $0.count == 1 ? PDFFDF.FieldValue.text($0[0]) : PDFFDF.FieldValue.array($0) }
+                    guard self.applyFDF(values,item: item) else { throw PDFSourceError.content }; view.setNeedsDisplay(view.bounds); return
+                }
+                guard self.applyExchangedComments(parsed.comments,item: item,view: view) else { throw PDFSourceError.content }
+                view.setNeedsDisplay(view.bounds); self.manager.send(.refresh)
+            } catch { self.manager.say("Cannot import XFDF.","Не удалось импортировать XFDF.") }
+        }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showOCR(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,item.document.allowsCopying,manager.operationTask == nil else { return }
+        PDFDialogs.prompt(manager.language == .ru ? "Локальное распознавание текста" : "Local OCR",fields: [("Страницы / Pages","all"),("Языки Vision / Languages","ru-RU,en-US"),("DPI (72–300)","150"),("Пропускать страницы с текстом / Skip text pages: 1/0","1")]) { [weak self,weak view] values in
+            guard let self,let view,item.document === view.document,self.manager.operationTask == nil,let indices = PDFPageRange.parse(values[0],count: item.pageCount),let dpi = Int(values[2]),(72...300).contains(dpi) else { return }
+            do {
+                let data = try self.manager.serializedData(item),document = item.document,stamp = PDFDocumentState.stamp(document)
+                let text = values[3] == "1" ? try PDFSourceTextReader.pages(data: data,indices: indices) : indices.map { _ in "" }
+                let target = zip(indices,text).filter { $0.1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.map(\.0)
+                guard !target.isEmpty else { self.manager.say("Selected pages already contain text.","Выбранные страницы уже содержат текст."); return }
+                let languages = values[1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                let id = UUID(),manager = self.manager
+                manager.activeOperationID = id; manager.operationProgress = 0; manager.operationTitle = "OCR"
+                manager.operationTask = Task { @MainActor [weak self,weak view] in
+                    defer { manager.activeOperationID = nil; manager.operationProgress = nil; manager.operationTask = nil }
+                    do {
+                        let worker = Task.detached(priority: .userInitiated) {
+                            try PDFOCREngine.recognize(data: data,indices: target,languages: languages,dpi: dpi) { progress in Task { @MainActor in if manager.activeOperationID == id { manager.operationProgress = progress } } }
+                        }
+                        let result = try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+                        try Task.checkCancellation()
+                        guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp else { throw PDFSourceError.alreadyUsed }
+                        guard result.lines > 0 else { manager.say("No text recognized.","Текст не распознан."); return }
+                        self.showOCRReview(result: result,source: data,dpi: dpi,item: item,view: view)
+                    } catch is CancellationError { }
+                    catch { manager.say("OCR unavailable or failed. Check Vision language support and the page size.","OCR недоступен или завершился ошибкой. Проверьте языки Vision и размер страницы.") }
+                }
+            } catch { self.sourceError(error) }
+        }
+    }
+    func showOCRReview(result: PDFOCRResult,source: Data,dpi: Int,item: PDFDocumentItem,view: PDFViewerView) {
+        let document = item.document,stamp = PDFDocumentState.stamp(item.document),manager = self.manager
+        manager.ocrReviewRequest = PDFOCRReviewRequest(russian: manager.language == .ru,dpi: dpi,source: source,pages: result.review,apply: { [weak self,weak view,weak manager] pages in
+            guard let self,let view,let manager,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges,
+                  manager.operationTask == nil,pages.allSatisfy({ (0..<document.pageCount).contains($0.index) }),PDFOCREngine.valid(pages: pages) else { return "Проверьте выбранные строки и рамки; документ не должен изменяться / Check selected lines and boxes; document must be unchanged" }
+            let id = UUID(); manager.activeOperationID = id; manager.operationProgress = 0; manager.operationTitle = "OCR"
+            manager.operationTask = Task { @MainActor [weak self,weak view] in
+                defer { manager.activeOperationID = nil; manager.operationProgress = nil; manager.operationTask = nil }
+                do {
+                    let worker = Task.detached(priority: .userInitiated) { try PDFOCREngine.render(pages: pages) }
+                    let edited = try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+                    try Task.checkCancellation()
+                    guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp else { throw PDFSourceError.alreadyUsed }
+                    let bytes = try PDFDocumentExtras.overlay(source,layer: edited.layer,indices: edited.pages)
+                    try self.installSourceData(bytes,item: item,index: item.pageIndex,view: view,bounds: nil); item.enableStreamPreservation()
+                    manager.say("OCR lines: \(edited.lines)","Строк OCR: \(edited.lines)")
+                } catch is CancellationError { }
+                catch { manager.say("Could not apply OCR layer. Original PDF is intact.","Не удалось применить слой OCR. Исходный PDF сохранён.") }
+            }
+            return nil
+        })
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showBookmarkTextEditor(item: PDFDocumentItem,operation: PDFBookmarkTextOperation,zoom: Double = 100) {
+        guard item.document.allowsDocumentChanges,manager.finishSourceEditing?() != false else { return }
+        let document = item.document
+        let scope = operation == .sort || operation == .merge ? manager.selectedOutline ?? document.outlineRoot : manager.selectedOutline
+        let nodes = scope.map { [$0]+manager.bookmarkNodes($0) } ?? manager.bookmarkNodes()
+        let undoGroup = "bookmarkTitles-"+UUID().uuidString
+        var previewStamp = PDFDocumentState.stamp(document)
+        manager.bookmarkTextRequest = PDFBookmarkTextRequest(russian: manager.language == .ru,operation: operation,initialZoom: zoom,load: { [weak self] options in
+            guard item.document === document else { return nil }
+            previewStamp = PDFDocumentState.stamp(document)
+            return PDFBookmarkTextPlan.make(nodes: nodes,document: document,operation: operation,options: options,russian: self?.manager.language == .ru)
+        },apply: { [weak self] changes in
+            guard let self,item.document === document,PDFDocumentState.stamp(document) == previewStamp,
+                  document.allowsDocumentChanges,changes.allSatisfy({ change in
+                      if case .title = change.mutation { return (change.node.label ?? "") == change.before }
+                      return true
+                  }) else {
+                return "Документ изменён. Обновите предпросмотр / Document changed. Update the preview"
+            }
+            guard !changes.isEmpty else { return nil }
+            let current = Set((self.manager.bookmarkNodes()+(document.outlineRoot.map { [$0] } ?? [])).map(ObjectIdentifier.init))
+            guard changes.allSatisfy({ current.contains($0.id) }) else { return "Состав закладок изменился. Откройте команду заново / Bookmarks changed. Reopen the command" }
+            guard self.manager.snapshot(item) != nil else { return "Не удалось подготовить Undo / Could not prepare Undo" }
+            self.manager.recordUndo(item,group: undoGroup)
+            PDFBookmarkTextPlan.apply(changes)
+            self.manager.send(.refresh); return nil
+        })
+    }
+    func showBookmarkValidation(item: PDFDocumentItem) {
+        let document = item.document,russian = manager.language == .ru
+        manager.bookmarkValidationRequest = PDFBookmarkValidationRequest(russian: russian,load: {
+            guard item.document === document else { return [] }
+            return PDFBookmarkValidator.rows(document: document,russian: russian)
+        },navigate: { [weak self] row in
+            guard let self,item.document === document,let page = row.page,
+                  document.page(at: page) === (row.node.destination ?? (row.node.action as? PDFActionGoTo)?.destination)?.page else { return }
+            self.manager.select(item.id)
+            guard self.manager.selectedID == item.id else { return }
+            self.manager.navigate(to: page)
+        })
+    }
+    func showTabTraversal(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,finishSourceEditor() else { return }
+        do {
+            let document = item.document,index = item.pageIndex,data = try manager.serializedData(item)
+            let rule = try PDFDocumentExtras.tabTraversal(data,pageIndex: index),stamp = PDFDocumentState.stamp(document)
+            manager.tabTraversalRequest = PDFTabTraversalRequest(russian: manager.language == .ru,current: rule.value,hasStructure: rule.hasStructure,apply: { [weak self,weak view] mode in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён. Откройте команду заново / Document changed. Reopen the command" }
+                do {
+                    let output = try PDFDocumentExtras.setTabTraversal(data,pageIndex: index,mode: mode)
+                    try self.installSourceData(output,item: item,index: index,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Не удалось записать правило Tab / Could not write Tab rule" }
+            })
+        } catch { sourceError(error) }
+    }
+    func showFormOrder(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,let page = item.document.page(at: item.pageIndex),manager.finishSourceEditing?() != false else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(item.document),undoGroup = "formOrder-"+UUID().uuidString
+        manager.formOrderRequest = PDFFormOrderRequest(russian: manager.language == .ru,page: page,apply: { [weak self,weak view] fields in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges,
+                  Set(fields.map(ObjectIdentifier.init)) == Set(page.annotations.filter { $0.type == "Widget" }.map(ObjectIdentifier.init)),self.manager.snapshot(item) != nil else { return "Документ изменён / Document changed" }
+            self.manager.recordUndo(item,group: undoGroup)
+            guard PDFFormOrder.apply(fields,page: page) else { return "Некорректный порядок полей / Invalid field order" }
+            view.setNeedsDisplay(view.bounds); self.manager.send(.refresh); return nil
+        })
+    }
+    func showFormValues(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsFormFieldEntry,let field = manager.selectedAnnotation,field.widgetFieldType == .choice,!field.isReadOnly else { return }
+        let choices = field.choices ?? [],exports = field.values ?? choices
+        let values = choices.enumerated().map { $0.offset < exports.count ? exports[$0.offset] : $0.element }
+        let selected = AnnotationMetadata.formSelections(field) ?? [PDFWidgetFactory.stringValue(field) ?? ""]
+        let multiple = ((field.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0)&(1<<21) != 0
+        let document = item.document,stamp = PDFDocumentState.stamp(item.document),undoGroup = "formValues-"+UUID().uuidString
+        manager.formValuesRequest = PDFFormValuesRequest(russian: manager.language == .ru,multiple: multiple,choices: choices,values: values,selected: selected,apply: { [weak self,weak view] selected in
+            guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsFormFieldEntry,!field.isReadOnly,
+                  selected.allSatisfy(values.contains),multiple || selected.count <= 1,self.manager.snapshot(item) != nil else { return "Документ изменён или некорректен выбор / Document changed or invalid selection" }
+            self.manager.recordUndo(item,group: undoGroup)
+            AnnotationMetadata.setFormSelections(selected,on: field); view.setNeedsDisplay(view.bounds); self.manager.send(.refresh); return nil
+        })
+    }
+    func showFormRule(item: PDFDocumentItem) {
+        guard item.document.allowsDocumentChanges,let field = manager.selectedAnnotation,field.widgetFieldType == .text else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(item.document),undoGroup = "formRule-"+UUID().uuidString
+        manager.formRuleRequest = PDFFormRuleRequest(russian: manager.language == .ru,value: PDFWidgetFactory.stringValue(field) ?? "",initial: AnnotationMetadata.formRule(field) ?? PDFFormRule(),apply: { [weak self] rule in
+            guard let self,item.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges,
+                  rule.minimum?.isFinite != false,rule.maximum?.isFinite != false,self.manager.snapshot(item) != nil else { return "Документ изменён / Document changed" }
+            self.manager.recordUndo(item,group: undoGroup); AnnotationMetadata.setFormRule(rule,on: field); self.manager.send(.refresh); return nil
+        })
+    }
+    func formIssues(item: PDFDocumentItem) -> [PDFFormIssue] {
+        let russian = manager.language == .ru
+        let all = (0..<item.pageCount).flatMap { index in (item.document.page(at: index)?.annotations ?? []).filter { $0.type == "Widget" }.map { (index,$0) } }
+        var issues: [PDFFormIssue] = [],requiredButtons = Set<String>()
+        for (page,field) in all {
+            let name = field.fieldName ?? "Field",value = PDFWidgetFactory.stringValue(field) ?? "",flags = (field.value(forAnnotationKey: .widgetFieldFlags) as? NSNumber)?.intValue ?? 0
+            var message: String?
+            if field.widgetFieldType == .button {
+                if flags&2 != 0,requiredButtons.insert(name).inserted,!all.contains(where: { $0.1.fieldName == name && $0.1.buttonWidgetState == .onState }) { message = russian ? "Обязательная группа не заполнена" : "Required group is empty" }
+            } else {
+                if flags&2 != 0,value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { message = russian ? "Обязательное поле не заполнено" : "Required field is empty" }
+                else if field.maximumLength > 0,value.count > field.maximumLength { message = russian ? "Превышена максимальная длина" : "Maximum length exceeded" }
+                else if let rule = AnnotationMetadata.formRule(field) { message = rule.issue(value,russian: russian) }
+                if message == nil,field.widgetFieldType == .choice {
+                    let allowed = field.values ?? field.choices ?? [],values = AnnotationMetadata.formSelections(field) ?? [value]
+                    if flags&(1<<18) == 0,values.contains(where: { !$0.isEmpty && !allowed.contains($0) }) { message = russian ? "Значение отсутствует в списке вариантов" : "Value is not among field choices" }
+                }
+            }
+            if let message { issues.append(PDFFormIssue(page: page,name: name,message: message)) }
+        }
+        return issues
+    }
+    func validateForm(item: PDFDocumentItem) {
+        guard item.document.allowsFormFieldEntry || item.document.allowsCopying else { return }
+        manager.formValidationRequest = PDFFormValidationRequest(russian: manager.language == .ru,issues: formIssues(item: item))
+    }
+    private func measurementSelectionCenter(_ inks: [PDFAnnotation]) -> CGPoint? {
+        var bounds = CGRect.null,count = 0
+        for ink in inks {
+            guard let measure = AnnotationMetadata.measurement(ink) else { return nil }; count += measure.points.count
+            guard count <= 200000 else { return nil }
+            for point in measure.points {
+                guard point.x.isFinite,point.y.isFinite,abs(point.x) <= 1_000_000,abs(point.y) <= 1_000_000 else { return nil }
+                bounds = bounds.union(CGRect(origin: point,size: .zero))
+            }
+        }
+        guard !bounds.isNull else { return nil }; return CGPoint(x: bounds.midX,y: bounds.midY)
+    }
+    func showMeasurementLabel(_ ink: PDFAnnotation,item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,view.canModifyAnnotationSelection,let measure = AnnotationMetadata.measurement(ink),[EngineeringKind.distance,.perimeter,.area].contains(measure.kind),(measure.kind != .distance || measure.dimensionOffset != nil) else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),selection = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        let initial = EngineeringLabelOptions(x: Double(measure.labelOffset?.x ?? 0),y: Double(measure.labelOffset?.y ?? 0),leader: measure.labelLeader != false,elbow: measure.leaderElbow != nil,elbowX: Double(measure.leaderElbow?.x ?? 40),elbowY: Double(measure.leaderElbow?.y ?? 20),waypoints: measure.leaderWaypoints,anchor: measure.effectiveLeaderAnchor)
+        manager.engineeringLabelRequest = EngineeringLabelRequest(russian: manager.language == .ru,initial: initial,apply: { [weak self,weak view] options in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == selection,let current = AnnotationMetadata.measurement(ink),current.labelOffset == measure.labelOffset,current.labelLeader == measure.labelLeader,current.leaderElbow == measure.leaderElbow,current.leaderWaypoints == measure.leaderWaypoints,current.effectiveLeaderAnchor == measure.effectiveLeaderAnchor else { return "Документ, выбор или подпись изменены / Document, selection or label changed" }
+            return self.setMeasurementLabel(ink,options: options,item: item,view: view) ? nil : "Проверьте смещения, размерные линии, блокировки и границы страницы / Check offsets, dimensions, locks and page bounds"
+        },contour: measure.kind != .distance)
+    }
+    @discardableResult func setMeasurementLabel(_ ink: PDFAnnotation,options: EngineeringLabelOptions,item: PDFDocumentItem,view: PDFViewerView) -> Bool {
+        guard view.document === item.document,item.document.allowsCommenting,let page = ink.page,page.document === item.document,ink.type == "Ink",let group = AnnotationMetadata.group(of: ink),var measure = AnnotationMetadata.measurement(ink),[EngineeringKind.distance,.perimeter,.area].contains(measure.kind),measure.value.isFinite,measure.value > 0,measure.points.count >= (measure.kind == .area ? 3 : 2),measure.points.count <= 20000,[options.x,options.y,options.elbowX,options.elbowY].allSatisfy({ $0.isFinite && abs($0) <= 10000 }),measure.points.allSatisfy({ $0.x.isFinite && $0.y.isFinite && abs($0.x) <= 1_000_000 && abs($0.y) <= 1_000_000 }) else { return false }
+        if measure.kind == .distance {
+            guard measure.points.count == 2,measure.dimensionOffset?.isFinite == true,let (a,b) = measure.dimensionBaseline,hypot(b.x-a.x,b.y-a.y) > 0.000001 else { return false }
+        } else { guard measure.contourLeaderMidpoint != nil else { return false } }
+        let parts = page.annotations.filter { AnnotationMetadata.group(of: $0) == group },labels = parts.filter { $0.type == "FreeText" }
+        guard labels.count == 1,let label = labels.first,parts.allSatisfy({ !AnnotationMetadata.isLocked($0) && ($0 === ink || $0 === label || ($0.type == "Line" && AnnotationMetadata.decoration(of: $0) == "engineeringDimension")) }) else { return false }
+        guard (options.waypoints?.count ?? 0) <= 32,(options.waypoints ?? []).allSatisfy({ $0.x.isFinite && $0.y.isFinite && abs($0.x) <= 10000 && abs($0.y) <= 10000 }) else { return false }
+        let offset = CGPoint(x: options.x,y: options.y),leader: Bool? = offset == .zero ? nil : options.leader
+        let requested = options.waypoints ?? (options.elbow ? [CGPoint(x: options.elbowX,y: options.elbowY)] : [])
+        let route = offset != .zero && options.leader ? requested : []
+        let anchor: EngineeringLeaderAnchor = offset != .zero && options.leader ? options.anchor : .midpoint
+        if (measure.labelOffset ?? .zero) == offset && (offset == .zero || (measure.labelLeader != false) == options.leader) && measure.effectiveLeaderWaypoints == route && measure.effectiveLeaderAnchor == anchor { return true }
+        measure.labelOffset = offset == .zero ? nil : offset; measure.labelLeader = leader; measure.leaderAnchor = anchor == .midpoint ? nil : anchor
+        measure.leaderElbow = route.count == 1 ? route[0] : nil; measure.leaderWaypoints = route.count > 1 ? route : nil
+        let probeDocument = PDFDocument(),probePage = PDFPage(); probePage.setBounds(page.bounds(for: .cropBox),for: .mediaBox); probeDocument.insert(probePage,at: 0)
+        defer { withExtendedLifetime(probeDocument) {} }
+        let probe = PDFAnnotation(bounds: ink.bounds,forType: .ink,withProperties: nil),probeLabel = PDFAnnotation(bounds: label.bounds,forType: .freeText,withProperties: nil)
+        probe.color = ink.color; probe.border = ink.border; probe.contents = measure.label(russian: manager.language == .ru)
+        AnnotationMetadata.setGroup(group,on: probe); AnnotationMetadata.setGroup(group,on: probeLabel); probePage.addAnnotation(probe); probePage.addAnnotation(probeLabel)
+        EngineeringDimensionRenderer.update(annotation: probe,measurement: measure)
+        let crop = page.bounds(for: .cropBox).insetBy(dx: -0.001,dy: -0.001)
+        guard probePage.annotations.allSatisfy({ crop.contains($0.bounds) }),manager.snapshot(item) != nil else { return false }
+        manager.recordUndo(item,group: "measurementLabel-"+UUID().uuidString)
+        AnnotationMetadata.setMeasurement(measure,on: ink); ink.contents = probe.contents; label.removeValue(forAnnotationKey: .appearanceDictionary)
+        EngineeringDimensionRenderer.update(annotation: ink,measurement: measure)
+        view.selectAnnotation(ink); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
+    }
+    func showMeasurementDirection(_ ink: PDFAnnotation,item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.document === item.document,view.canModifyAnnotationSelection,let measure = AnnotationMetadata.measurement(ink),measure.kind == .distance else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),selection = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        manager.engineeringDirectionRequest = EngineeringDirectionRequest(russian: manager.language == .ru,degrees: measure.direction ?? 0,apply: { [weak self,weak view] angle in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == selection,let current = AnnotationMetadata.measurement(ink),current.axis == measure.axis,current.directionDegrees == measure.directionDegrees else { return "Документ, выбор или направление изменены / Document, selection or direction changed" }
+            guard angle.isFinite,(-360...360).contains(angle),self.setMeasurementAxis(ink,axis: .custom,item: item,view: view,degrees: angle) else { return "Проверьте угол, блокировки и границы размерных линий / Check angle, locks and dimension bounds" }; return nil
+        })
+    }
+    @discardableResult func setMeasurementAxis(_ ink: PDFAnnotation,axis: EngineeringDistanceAxis,item: PDFDocumentItem,view: PDFViewerView,degrees: Double? = nil) -> Bool {
+        guard view.document === item.document,item.document.allowsCommenting,let page = ink.page,page.document === item.document,ink.type == "Ink",let group = AnnotationMetadata.group(of: ink),var measure = AnnotationMetadata.measurement(ink),measure.kind == .distance,measure.points.count == 2,measure.scale.valid,measure.points.allSatisfy({ $0.x.isFinite && $0.y.isFinite && abs($0.x) <= 1_000_000 && abs($0.y) <= 1_000_000 }) else { return false }
+        let parts = page.annotations.filter { AnnotationMetadata.group(of: $0) == group },labels = parts.filter { $0.type == "FreeText" }
+        guard labels.count == 1,let label = labels.first,parts.allSatisfy({ !AnnotationMetadata.isLocked($0) && ($0 === ink || $0 === label || ($0.type == "Line" && AnnotationMetadata.decoration(of: $0) == "engineeringDimension")) }) else { return false }
+        let direction = axis == .custom ? (degrees ?? measure.directionDegrees).flatMap(EngineeringMeasure.normalizedDirection) : nil
+        guard axis != .custom || direction != nil else { return false }
+        if measure.axis == axis && (axis != .custom || measure.direction == direction) { return true }
+        measure.distanceAxis = axis == .aligned ? nil : axis; measure.directionDegrees = direction
+        guard measure.value.isFinite else { return false }
+        let probeDocument = PDFDocument(),probePage = PDFPage(); probePage.setBounds(page.bounds(for: .cropBox),for: .mediaBox); probeDocument.insert(probePage,at: 0)
+        defer { withExtendedLifetime(probeDocument) {} }
+        let probe = PDFAnnotation(bounds: ink.bounds,forType: .ink,withProperties: nil),probeLabel = PDFAnnotation(bounds: label.bounds,forType: .freeText,withProperties: nil)
+        probe.color = ink.color; probe.border = ink.border; probe.contents = measure.label(russian: manager.language == .ru)
+        AnnotationMetadata.setGroup(group,on: probe); AnnotationMetadata.setGroup(group,on: probeLabel); probePage.addAnnotation(probe); probePage.addAnnotation(probeLabel)
+        EngineeringDimensionRenderer.update(annotation: probe,measurement: measure)
+        let crop = page.bounds(for: .cropBox).insetBy(dx: -0.001,dy: -0.001)
+        guard probePage.annotations.allSatisfy({ crop.contains($0.bounds) }),manager.snapshot(item) != nil else { return false }
+        manager.recordUndo(item,group: "measurementAxis-"+UUID().uuidString)
+        AnnotationMetadata.setMeasurement(measure,on: ink); ink.contents = probe.contents; label.contents = probe.contents
+        label.removeValue(forAnnotationKey: .appearanceDictionary); EngineeringDimensionRenderer.update(annotation: ink,measurement: measure)
+        view.selectAnnotation(ink); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
+    }
+    func showEngineeringTransform(item: PDFDocumentItem,view: PDFViewerView) {
+        let inks = view.selectedAnnotations.filter { AnnotationMetadata.measurement($0) != nil }
+        guard view.document === item.document,view.canModifyAnnotationSelection,!inks.isEmpty,inks.count == view.annotationSelectionUnitCount,let center = measurementSelectionCenter(inks) else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),selection = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        let apply: (EngineeringAffineOptions) -> String? = { [weak self,weak view] options in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == selection else { return "Документ или выбор изменён / Document or selection changed" }
+            return self.transformMeasurements(inks,options: options,item: item,view: view) ? nil : "Проверьте матрицу, центр, блокировку, состав измерений и границы страницы / Check matrix, center, locks, measurement parts and page bounds"
+        }
+        manager.engineeringTransformRequest = EngineeringTransformRequest(russian: manager.language == .ru,count: inks.count,selectionCenter: center,applyAffine: apply,apply: { angle,mx,my,percent,preservingValue in
+            var options = EngineeringAffineOptions(); options.degrees = angle; options.mirrorX = mx; options.mirrorY = my; options.scaleX = percent/100; options.scaleY = percent/100; options.preservingValue = preservingValue; return apply(options)
+        })
+    }
+    @discardableResult func transformMeasurement(_ ink: PDFAnnotation,degrees: Double,mirrorX: Bool,mirrorY: Bool,factor: Double = 1,preservingValue: Bool = true,item: PDFDocumentItem,view: PDFViewerView) -> Bool {
+        transformMeasurements([ink],degrees: degrees,mirrorX: mirrorX,mirrorY: mirrorY,factor: factor,preservingValue: preservingValue,item: item,view: view)
+    }
+    @discardableResult func transformMeasurements(_ inks: [PDFAnnotation],degrees: Double,mirrorX: Bool,mirrorY: Bool,factor: Double = 1,preservingValue: Bool = true,item: PDFDocumentItem,view: PDFViewerView) -> Bool {
+        var options = EngineeringAffineOptions(); options.degrees = degrees; options.mirrorX = mirrorX; options.mirrorY = mirrorY; options.scaleX = factor; options.scaleY = factor; options.preservingValue = preservingValue
+        return transformMeasurements(inks,options: options,item: item,view: view)
+    }
+    @discardableResult func transformMeasurements(_ inks: [PDFAnnotation],options: EngineeringAffineOptions,item: PDFDocumentItem,view: PDFViewerView) -> Bool {
+        guard view.document === item.document,item.document.allowsCommenting,!inks.isEmpty,inks.count <= 10000,let page = inks.first?.page,page.document === item.document,Set(inks.map(ObjectIdentifier.init)).count == inks.count else { return false }
+        guard let commonCenter = measurementSelectionCenter(inks) else { return false }
+        struct Plan { let ink: PDFAnnotation,label: PDFAnnotation,measure: EngineeringMeasure,box: CGRect,paths: [NSBezierPath],labelBox: CGRect,text: String }
+        var plans: [Plan] = [],groups = Set<String>()
+        for ink in inks {
+            guard ink.type == "Ink",ink.page === page,let group = AnnotationMetadata.group(of: ink),groups.insert(group).inserted,let old = AnnotationMetadata.measurement(ink),let measure = old.transformed(options: options,selectionCenter: commonCenter) else { return false }
+            let parts = page.annotations.filter { AnnotationMetadata.group(of: $0) == group },labels = parts.filter { $0.type == "FreeText" }
+            guard labels.count == 1,parts.allSatisfy({ !AnnotationMetadata.isLocked($0) && ($0 === ink || $0.type == "FreeText" || ($0.type == "Line" && AnnotationMetadata.decoration(of: $0) == "engineeringDimension")) }),let label = labels.first else { return false }
+            if options.isIdentity { continue }
+            let probeDocument = PDFDocument(),probePage = PDFPage(); probePage.setBounds(page.bounds(for: .cropBox),for: .mediaBox); probeDocument.insert(probePage,at: 0)
+            defer { withExtendedLifetime(probeDocument) {} }
+            let probe = PDFAnnotation(bounds: ink.bounds,forType: .ink,withProperties: nil); probe.border = ink.border; probe.color = ink.color; probe.contents = measure.label(russian: manager.language == .ru)
+            let path = PDFAnnotationVertexPath(vertices: measure.points.map { PDFAnnotationVertex(x: $0.x,y: $0.y) },closed: measure.kind == .area)
+            guard PDFAnnotationVertexGeometry.apply([path],to: probe) else { return false }
+            let probeLabel = PDFAnnotation(bounds: CGRect(x: probe.bounds.midX-label.bounds.width/2,y: probe.bounds.maxY+4,width: label.bounds.width,height: label.bounds.height),forType: .freeText,withProperties: nil)
+            AnnotationMetadata.setGroup(group,on: probe); AnnotationMetadata.setGroup(group,on: probeLabel)
+            probePage.addAnnotation(probe); probePage.addAnnotation(probeLabel); EngineeringDimensionRenderer.update(annotation: probe,measurement: measure)
+            let crop = page.bounds(for: .cropBox).insetBy(dx: -0.001,dy: -0.001)
+            guard probePage.annotations.allSatisfy({ crop.contains($0.bounds) }),let paths = probe.paths else { return false }
+            plans.append(Plan(ink: ink,label: label,measure: measure,box: probe.bounds,paths: paths,labelBox: probeLabel.bounds,text: probe.contents ?? ""))
+        }
+        guard !plans.isEmpty else { return true }
+        guard manager.snapshot(item) != nil else { return false }
+        manager.recordUndo(item,group: "measurementTransform-"+UUID().uuidString)
+        for plan in plans {
+            for path in plan.ink.paths ?? [] { plan.ink.remove(path) }; plan.ink.bounds = plan.box
+            for path in plan.paths { plan.ink.add(path) }
+            AnnotationMetadata.setMeasurement(plan.measure,on: plan.ink); AnnotationMetadata.setInkCurves(nil,on: plan.ink); plan.ink.contents = plan.text; plan.ink.removeValue(forAnnotationKey: .appearanceDictionary)
+            plan.label.bounds = plan.labelBox; plan.label.contents = plan.text; plan.label.removeValue(forAnnotationKey: .appearanceDictionary)
+            EngineeringDimensionRenderer.update(annotation: plan.ink,measurement: plan.measure)
+        }
+        view.selectAnnotations(inks); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); manager.send(.refresh); return true
+    }
+    func showEngineeringTransfer(item: PDFDocumentItem,view: PDFViewerView) {
+        let inks = view.selectedAnnotations.filter { AnnotationMetadata.measurement($0) != nil }
+        guard view.document === item.document,item.pageCount > 1,view.canModifyAnnotationSelection,!inks.isEmpty,inks.count == view.annotationSelectionUnitCount,let page = inks.first?.page else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),selection = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        manager.engineeringTransferRequest = EngineeringTransferRequest(russian: manager.language == .ru,count: inks.count,pageCount: item.pageCount,sourcePage: document.index(for: page),apply: { [weak self,weak view] options in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == selection else { return "Документ или выбор изменён / Document or selection changed" }
+            return self.transferMeasurements(inks,options: options,item: item,view: view) ? nil : "Проверьте страницу, калибровку, блокировку и границы всех частей измерений / Check destination, calibration, locks and bounds of all measurement parts"
+        })
+    }
+    func showEngineeringDocumentCopy(item: PDFDocumentItem,view: PDFViewerView) {
+        let inks = view.selectedAnnotations.filter { AnnotationMetadata.measurement($0) != nil }
+        guard view.document === item.document,item.document.allowsCopying,view.canModifyAnnotationSelection,!inks.isEmpty,inks.count == view.annotationSelectionUnitCount else { return }
+        var seen = Set<ObjectIdentifier>()
+        let targets = manager.documents.filter { $0.document !== item.document && $0.document.allowsCommenting && $0.pageCount > 0 && seen.insert(ObjectIdentifier($0.document)).inserted }
+        guard let first = targets.first else { manager.say("Open another PDF that allows comments.","Откройте другой PDF, разрешающий комментарии."); return }
+        let source = item.document,stamp = PDFDocumentState.stamp(source),selection = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        let states = targets.map { ($0,$0.document,PDFDocumentState.stamp($0.document)) }
+        manager.engineeringTransferRequest = EngineeringTransferRequest(russian: manager.language == .ru,count: inks.count,pageCount: first.pageCount,sourcePage: -1,apply: { _ in "Выберите целевой PDF / Select destination PDF" },destinations: targets.map { EngineeringCopyDestination(id: $0.id,title: $0.filename,pageCount: $0.pageCount,currentPage: $0.pageIndex) },applyToDocument: { [weak self,weak view] id,options in
+            guard let self,let view,item.document === source,view.document === source,PDFDocumentState.stamp(source) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == selection,
+                  self.manager.documents.contains(where: { $0 === item }),let state = states.first(where: { $0.0.id == id }),self.manager.documents.contains(where: { $0 === state.0 }),state.0.document === state.1,PDFDocumentState.stamp(state.1) == state.2 else { return "Документ, выбор или целевой PDF изменён/закрыт / Document, selection or destination changed/closed" }
+            return self.transferMeasurements(inks,options: options,item: item,view: view,destination: state.0) ? nil : "Проверьте разрешения, страницу, калибровку, блокировки и границы измерений / Check permissions, page, calibration, locks and measurement bounds"
+        })
+    }
+    @discardableResult func transferMeasurements(_ inks: [PDFAnnotation],options: EngineeringTransferOptions,item: PDFDocumentItem,view: PDFViewerView,destination: PDFDocumentItem? = nil) -> Bool {
+        let output = destination ?? item,copying = destination != nil
+        guard !copying || (item.document.allowsCopying && output.document !== item.document && manager.documents.contains(where: { $0 === output })),output.document.allowsCommenting else { return false }
+        guard view.document === item.document,item.document.allowsCommenting,!inks.isEmpty,inks.count <= 10000,let source = inks.first?.page,source.document === item.document,
+              (0..<output.pageCount).contains(options.pageIndex),let target = output.document.page(at: options.pageIndex),target !== source,
+              Set(inks.map(ObjectIdentifier.init)).count == inks.count,measurementSelectionCenter(inks) != nil,
+              options.offsetX.isFinite,options.offsetY.isFinite,abs(options.offsetX) <= 1_000_000,abs(options.offsetY) <= 1_000_000 else { return false }
+        let targetScale = EngineeringCalibration.read(target)
+        guard !options.useTargetScale || targetScale?.valid == true else { return false }
+        struct Family { let ink: PDFAnnotation,label: PDFAnnotation,parts: [PDFAnnotation],measure: EngineeringMeasure }
+        var families: [Family] = [],groups = Set<String>(),bounds = CGRect.null
+        for ink in inks {
+            guard ink.type == "Ink",ink.page === source,let group = AnnotationMetadata.group(of: ink),groups.insert(group).inserted,
+                  (copying || !target.annotations.contains(where: { AnnotationMetadata.group(of: $0) == group })),let measure = AnnotationMetadata.measurement(ink) else { return false }
+            let parts = source.annotations.filter { AnnotationMetadata.group(of: $0) == group },labels = parts.filter { $0.type == "FreeText" }
+            guard labels.count == 1,let label = labels.first,parts.allSatisfy({ !AnnotationMetadata.isLocked($0) && ($0 === ink || $0 === label || ($0.type == "Line" && AnnotationMetadata.decoration(of: $0) == "engineeringDimension")) }) else { return false }
+            for part in parts { let box = part.bounds; guard [box.minX,box.minY,box.width,box.height].allSatisfy({ $0.isFinite }),box.width >= 0,box.height >= 0 else { return false }; bounds = bounds.union(box) }
+            families.append(Family(ink: ink,label: label,parts: parts,measure: measure))
+        }
+        let crop = target.bounds(for: .cropBox),original = source.bounds(for: .cropBox)
+        guard [crop.minX,crop.minY,crop.width,crop.height,original.minX,original.minY].allSatisfy({ $0.isFinite }),crop.width > 0,crop.height > 0 else { return false }
+        let dx = (options.centered ? crop.midX-bounds.midX : crop.minX-original.minX)+options.offsetX,dy = (options.centered ? crop.midY-bounds.midY : crop.minY-original.minY)+options.offsetY
+        var transform = EngineeringAffineOptions(); transform.offsetX = dx; transform.offsetY = dy; transform.preservingValue = false
+        var measures: [EngineeringMeasure] = []
+        for family in families {
+            guard var measure = family.measure.transformed(options: transform),family.parts.allSatisfy({ crop.insetBy(dx: -0.001,dy: -0.001).contains($0.bounds.offsetBy(dx: dx,dy: dy)) }) else { return false }
+            if options.useTargetScale,let targetScale { measure.scale = targetScale }
+            guard measure.value.isFinite else { return false }; measures.append(measure)
+        }
+        var outputFamilies = families
+        if copying {
+            outputFamilies = []
+            for family in families {
+                let copies = family.parts.compactMap(annotationCopy)
+                guard copies.count == family.parts.count,let inkIndex = family.parts.firstIndex(where: { $0 === family.ink }),let labelIndex = family.parts.firstIndex(where: { $0 === family.label }) else { return false }
+                AnnotationMetadata.transfer(from: family.parts,to: copies)
+                for copy in copies { copy.removeValue(forAnnotationKey: PDFAnnotationKey(rawValue: "NM")) }
+                outputFamilies.append(Family(ink: copies[inkIndex],label: copies[labelIndex],parts: copies,measure: family.measure))
+            }
+        }
+        guard manager.snapshot(output) != nil else { return false }
+        manager.recordUndo(output,group: "measurementTransfer-"+UUID().uuidString)
+        for (family,measure) in zip(outputFamilies,measures) {
+            for part in family.parts { if !copying { source.removeAnnotation(part) }; part.bounds = part.bounds.offsetBy(dx: dx,dy: dy); target.addAnnotation(part) }
+            AnnotationMetadata.setMeasurement(measure,on: family.ink)
+            let text = measure.label(russian: manager.language == .ru); family.ink.contents = text; family.label.contents = text
+            if options.useTargetScale { family.label.removeValue(forAnnotationKey: .appearanceDictionary) }
+        }
+        output.pageIndex = options.pageIndex
+        if copying { manager.select(output.id) }
+        else { view.go(to: target); view.selectAnnotations(inks); view.refreshOverlay(); view.setNeedsDisplay(view.bounds) }
+        manager.send(.refresh); return true
+    }
+
+    func showEngineeringScale(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsCommenting,let page = item.document.page(at: item.pageIndex),manager.finishSourceEditing?() != false else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(item.document),selected = manager.selectedAnnotation
+        let selectedMeasure = selected.flatMap(AnnotationMetadata.measurement),current = selectedMeasure?.scale ?? EngineeringCalibration.read(page) ?? EngineeringScale(unit: manager.engineeringUnit)
+        var initial = EngineeringScaleOptions(); initial.denominator = current.millimetersPerPoint/(25.4/72); initial.unit = current.unit; initial.selectedOnly = selectedMeasure != nil
+        if let selectedMeasure { initial.dimensionLines = selectedMeasure.dimensionOffset != nil; initial.dimensionOffset = selectedMeasure.dimensionOffset ?? 12 }
+        let undoGroup = "engineeringScaleEditor-"+UUID().uuidString
+        manager.engineeringScaleRequest = EngineeringScaleRequest(russian: manager.language == .ru,hasSelection: selectedMeasure != nil,initial: initial,apply: { [weak self,weak view] options in
+            guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsCommenting,
+                  options.denominator.isFinite,(0.000001...1e12).contains(options.denominator),options.dimensionOffset.isFinite,abs(options.dimensionOffset) <= 10000 else { return "Документ изменён или некорректен масштаб / Document changed or invalid scale" }
+            let scale = EngineeringScale(millimetersPerPoint: (25.4/72)*options.denominator,unit: options.unit)
+            let indices = options.range.trimmingCharacters(in: .whitespaces).lowercased() == "current" ? [document.index(for: page)] : PDFPageRange.parse(options.range,count: document.pageCount) ?? []
+            guard scale.valid,options.selectedOnly ? selectedMeasure != nil : !indices.isEmpty,
+                  self.manager.snapshot(item) != nil else { return "Проверьте диапазон / Check page range" }
+            self.manager.recordUndo(item,group: undoGroup)
+            let pages = options.selectedOnly ? [page] : indices.compactMap { document.page(at: $0) }
+            for target in pages {
+                if !options.selectedOnly { do { try EngineeringCalibration.write(scale,page: target) } catch { return "Ошибка калибровки / Calibration failed" } }
+                let measurements = options.selectedOnly ? selected.map { [$0] } ?? [] : target.annotations.filter { AnnotationMetadata.measurement($0) != nil }
+                if options.selectedOnly || options.updateExisting {
+                    for annotation in measurements {
+                        guard var measure = AnnotationMetadata.measurement(annotation) else { continue }; measure.scale = scale
+                        if measure.kind == .distance { measure.dimensionOffset = options.dimensionLines ? options.dimensionOffset : nil }
+                        AnnotationMetadata.setMeasurement(measure,on: annotation); annotation.contents = measure.label(russian: self.manager.language == .ru)
+                        if let group = AnnotationMetadata.group(of: annotation) {
+                            for label in target.annotations where label !== annotation && label.type == "FreeText" && AnnotationMetadata.group(of: label) == group { label.contents = annotation.contents }
+                        }
+                        EngineeringDimensionRenderer.update(annotation: annotation,measurement: measure)
+                    }
+                }
+            }
+            self.manager.engineeringUnit = options.unit; view.refreshOverlay(); view.setNeedsDisplay(view.bounds); self.manager.send(.refresh); return nil
+        })
+    }
+    func showAnnotationRotation(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.canModifyAnnotationSelection,view.document === item.document else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),ids = Set(view.selectedAnnotations.map(ObjectIdentifier.init))
+        manager.annotationRotationRequest = PDFAnnotationRotationRequest(russian: manager.language == .ru,apply: { [weak self,weak view] degrees in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == ids else { return "Документ или выбор изменён / Document or selection changed" }
+            guard degrees.isFinite,(-360...360).contains(degrees),view.rotateAnnotationSelection(degrees: CGFloat(degrees)) else { return "Проверьте угол, типы объектов, блокировку и границы страницы / Check angle, object types, locks and page bounds" }
+            self.manager.send(.refresh); return nil
+        })
+    }
+    func showAnnotationScale(item: PDFDocumentItem,view: PDFViewerView) {
+        guard view.canModifyAnnotationSelection,view.document === item.document else { return }
+        let document = item.document,stamp = PDFDocumentState.stamp(document),ids = Set(view.selectedAnnotations.map(ObjectIdentifier.init)),box = view.annotationSelectionBounds
+        manager.annotationScaleRequest = PDFAnnotationScaleRequest(russian: manager.language == .ru,width: Double(box.width),height: Double(box.height),apply: { [weak self,weak view] x,y in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,Set(view.selectedAnnotations.map(ObjectIdentifier.init)) == ids else { return "Документ или выбор изменён / Document or selection changed" }
+            guard x.isFinite,y.isFinite,(10...1000).contains(x),(10...1000).contains(y),view.scaleAnnotationSelection(x: CGFloat(x/100),y: CGFloat(y/100)) else { return "Проверьте масштаб, типы объектов, блокировку и границы страницы / Check scale, object types, locks and page bounds" }
+            self.manager.send(.refresh); return nil
+        })
+    }
+    func showInkCurves(_ annotation: PDFAnnotation,item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsCommenting,annotation.type == "Ink",annotation.page?.document === item.document,!AnnotationMetadata.isLocked(annotation) else { return }
+        do {
+            let nodes = try PDFInkCurveGeometry.read(annotation,record: AnnotationMetadata.inkCurves(annotation)),document = item.document
+            let stamp = PDFDocumentState.stamp(document),undoGroup = "inkCurves-"+UUID().uuidString
+            manager.pathRequest = PDFPathRequest(nodes: nodes,russian: manager.language == .ru,ink: true,apply: { [weak self,weak view] nodes in
+                guard let self,let view,item.document === document,view.document === document,annotation.page?.document === document,
+                      PDFDocumentState.stamp(document) == stamp,document.allowsCommenting,!AnnotationMetadata.isLocked(annotation) else { return "Документ изменён / Document changed" }
+                let probe = PDFAnnotation(bounds: annotation.bounds,forType: .ink,withProperties: nil); probe.border = annotation.border
+                guard PDFInkCurveGeometry.apply(nodes,to: probe) != nil,self.manager.snapshot(item) != nil else { return "Проверьте узлы, координаты и сложность кривых / Check nodes, coordinates and curve complexity" }
+                self.manager.recordUndo(item,group: undoGroup)
+                guard let record = PDFInkCurveGeometry.apply(nodes,to: annotation) else { return "Не удалось применить кривые / Could not apply curves" }
+                AnnotationMetadata.setInkCurves(record,on: annotation); view.refreshOverlay(); view.setNeedsDisplay(view.bounds); self.manager.send(.refresh); return nil
+            })
+        } catch { manager.say("Cannot read the Ink paths.","Не удалось прочитать штрихи Ink.") }
+    }
+    func showAnnotationVertices(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsCommenting,let selected = manager.selectedAnnotation else { return }
+        let annotation: PDFAnnotation
+        if ["Line","Ink"].contains(selected.type ?? "") { annotation = selected }
+        else if let group = AnnotationMetadata.group(of: selected),let line = selected.page?.annotations.first(where: { $0.type == "Line" && AnnotationMetadata.group(of: $0) == group }) { annotation = line }
+        else { return }
+        guard !AnnotationMetadata.isLocked(annotation) else { return }
+        if annotation.type == "Ink",AnnotationMetadata.measurement(annotation) == nil { showInkCurves(annotation,item: item,view: view); return }
+        do {
+            let paths = try PDFAnnotationVertexGeometry.read(annotation),document = item.document,stamp = PDFDocumentState.stamp(item.document),undoGroup = "annotationVertices-"+UUID().uuidString
+            manager.annotationVertexRequest = PDFAnnotationVertexRequest(russian: manager.language == .ru,line: annotation.type == "Line",initial: paths,apply: { [weak self,weak view] paths in
+                guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp,annotation.page?.document === document,
+                      document.allowsCommenting,!AnnotationMetadata.isLocked(annotation),self.manager.snapshot(item) != nil else { return "Документ изменён / Document changed" }
+                let probe = PDFAnnotation(bounds: annotation.bounds,forType: annotation.type == "Line" ? .line : .ink,withProperties: nil)
+                guard PDFAnnotationVertexGeometry.apply(paths,to: probe) else { return "Проверьте координаты и число вершин / Check coordinates and vertex count" }
+                self.manager.recordUndo(item,group: undoGroup)
+                _ = PDFAnnotationVertexGeometry.apply(paths,to: annotation)
+                AnnotationMetadata.setInkCurves(nil,on: annotation)
+                if AnnotationMetadata.measurement(annotation) != nil { view.selectAnnotation(annotation); view.updateEngineeringMeasurement() }
+                view.refreshOverlay(); view.setNeedsDisplay(view.bounds); self.manager.send(.refresh); return nil
+            })
+        } catch { manager.say("Only line segments and polygonal Ink paths are supported. Curved strokes are kept intact.","Поддерживаются отрезки и ломаные Ink. Штрихи с кривыми сохраняются без изменений.") }
+    }
+    func showHeadingBookmarks(item: PDFDocumentItem,view: PDFViewerView,fromTOC: Bool) {
+        guard item.document.allowsCopying else { return }
+        let document = item.document,initialPage = item.pageIndex,undoGroup = "headingBookmarks-"+UUID().uuidString
+        var previewStamp = PDFDocumentState.stamp(document)
+        manager.headingRequest = PDFHeadingRequest(russian: manager.language == .ru,fromTOC: fromTOC,load: { [weak self] options in
+            guard let self,item.document === document,options.minimumFont.isFinite,(1...200).contains(options.minimumFont),
+                  (-100000...100000).contains(options.offset),(0...3).contains(options.columns) else { throw PDFSourceError.content }
+            let indices = options.range.trimmingCharacters(in: .whitespaces).lowercased() == "current" ? [initialPage] : PDFPageRange.parse(options.range,count: item.pageCount) ?? []
+            guard !indices.isEmpty else { throw PDFSourceError.content }
+            previewStamp = PDFDocumentState.stamp(document)
+            var rows: [PDFHeadingCandidate] = []
+            if fromTOC {
+                for index in indices {
+                    guard let page = document.page(at: index) else { continue }
+                    let box = page.bounds(for: .cropBox)
+                    let selections = page.selection(for: box)?.selectionsByLine() ?? []
+                    let lines = selections.compactMap { selection -> PDFTOCTextLine? in
+                        guard let text = selection.string,!text.isEmpty else { return nil }
+                        let bounds = selection.bounds(for: page)
+                        return PDFTOCTextLine(text: text,bounds: bounds,fontSize: max(6,bounds.height))
+                    }
+                    rows += PDFTOCRecognizer.candidates(lines: lines,bounds: box,document: document,options: options)
+                }
+            } else {
+                let data = try self.manager.serializedData(item)
+                var values: [(String,Int,CGPoint,Double)] = []
+                for index in indices {
+                    guard let page = document.page(at: index) else { continue }
+                    let blocks = try PDFSourceSession.blocks(data: data,pageIndex: index)
+                    let lines = blocks.enumerated().map { PDFTOCTextLine(text: $0.element.snapshot.text,bounds: $0.element.snapshot.bounds,fontSize: Double($0.element.snapshot.fontSize),sourceIndex: $0.offset) }
+                    for column in PDFTOCRecognizer.columns(lines,bounds: page.bounds(for: .cropBox),count: options.columns) {
+                        for line in column {
+                            guard let at = line.sourceIndex,blocks.indices.contains(at) else { continue }
+                            let block = blocks[at],snapshot = block.snapshot
+                            let title = snapshot.text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                            guard snapshot.fontSize >= options.minimumFont,(2...600).contains(title.count) else { continue }
+                            if options.scheme == 1,title.range(of: #"^\d+(?:\.\d+)*[.)]?\s+"#,options: .regularExpression) == nil { continue }
+                            if options.scheme == 2,!["bold","demi","black","heavy"].contains(where: snapshot.fontName.lowercased().contains) { continue }
+                            values.append((title,index,CGPoint(x: snapshot.bounds.minX,y: snapshot.bounds.maxY),Double(snapshot.fontSize)))
+                        }
+                    }
+                }
+                let sizes = Array(Set(values.map { ($0.3*2).rounded()/2 })).sorted(by: >)
+                for row in values {
+                    let numbered = row.0.prefix { $0.isNumber || $0 == "." }.split(separator: ".").count
+                    let level = options.scheme == 1 ? max(0,numbered-1) : sizes.firstIndex(of: (row.3*2).rounded()/2) ?? 0
+                    rows.append(PDFHeadingCandidate(title: row.0,page: row.1,point: row.2,level: min(8,level)))
+                }
+            }
+            return Array(rows.prefix(10000))
+        },apply: { [weak self] rows in
+            guard let self,item.document === document,PDFDocumentState.stamp(document) == previewStamp,
+                  document.allowsDocumentChanges,rows.allSatisfy({ (0..<document.pageCount).contains($0.page) && !$0.title.trimmingCharacters(in: .whitespaces).isEmpty && $0.title.utf16.count <= 20000 }),
+                  self.manager.snapshot(item) != nil else { return "Документ изменён или некорректны заголовки / Document changed or invalid headings" }
+            self.manager.recordUndo(item,group: undoGroup)
+            guard let root = self.manager.bookmarkRoot() else { return "Нет дерева закладок / No bookmark tree" }
+            var stack: [(Int,PDFOutline)] = []
+            for row in rows {
+                guard let page = document.page(at: row.page) else { continue }
+                while let last = stack.last,last.0 >= row.level { stack.removeLast() }
+                let node = PDFOutline(); node.label = row.title; node.destination = PDFDestination(page: page,at: row.point)
+                let parent = stack.last?.1 ?? root; parent.insertChild(node,at: parent.numberOfChildren); stack.append((row.level,node))
+            }
+            self.manager.panels.select(.bookmarks); self.manager.send(.refresh); return nil
+        })
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func namedBookmarks(item: PDFDocumentItem,view: PDFViewerView,convertToNames: Bool) {
+        do {
+            let data = try manager.serializedData(item)
+            if !convertToNames {
+                let nodes = manager.bookmarkNodes(),targets = try PDFDocumentExtras.namedTargets(data)
+                manager.recordUndo(item,group: "namedToDirect")
+                var converted = 0
+                for node in nodes { if let destination = node.destination ?? (node.action as? PDFActionGoTo)?.destination,let page = destination.page {
+                    let copy = PDFDestination(page: page,at: destination.point); copy.zoom = destination.zoom; node.destination = copy; node.action = PDFActionGoTo(destination: copy); converted += 1
+                } }
+                manager.send(.refresh); manager.say("Named destinations: \(targets.count). Resolved bookmark links: \(converted).","Именованных назначений: \(targets.count). Прямых ссылок закладок: \(converted).")
+                return
+            }
+            var targets = try PDFDocumentExtras.namedTargets(data),mapping: [Int:String] = [:]
+            let nodes = manager.bookmarkNodes(),selected = manager.selectedOutline.map { Set(([$0]+manager.bookmarkNodes($0)).map(ObjectIdentifier.init)) }
+            for (index,node) in nodes.enumerated() {
+                guard selected == nil || selected!.contains(ObjectIdentifier(node)),let destination = node.destination ?? (node.action as? PDFActionGoTo)?.destination,let page = destination.page else { continue }
+                let at = item.document.index(for: page); guard at >= 0,at < item.pageCount else { continue }
+                let name = "BotPlus-"+UUID().uuidString
+                targets.append(PDFNamedTarget(name: name,page: at,x: destination.point.x,y: destination.point.y,zoom: destination.zoom)); mapping[index] = name
+            }
+            guard !mapping.isEmpty else { return }
+            let bytes = try PDFDocumentExtras.writeNamedTargets(data,targets: targets,bookmarks: mapping)
+            guard let document = PDFDocument(data: bytes),document.pageCount == item.pageCount else { throw PDFSourceError.save }
+            AnnotationMetadata.restore(document); manager.recordUndo(item,group: "bookmarksToNamed")
+            item.document = document; item.enableStreamPreservation(); reload(view,document: item,pageIndex: item.pageIndex); manager.send(.refresh); manager.seedSerializedData(bytes,item: item)
+        } catch { sourceError(error) }
+    }
+}
+
+@MainActor private extension DocumentManager {
+    func openScanner() {
+        scannerRequest = PDFScannerRequest(russian: language == .ru) { [weak self] urls in
+            guard let self else { return "Окно документа закрыто / Document window closed" }
+            let document = PDFDocument()
+            for url in urls {
+                if let source = PDFDocument(url: url),!source.isLocked,source.pageCount > 0 {
+                    for index in 0..<source.pageCount {
+                        guard let page = source.page(at: index)?.copy() as? PDFPage else { return "Не удалось прочитать страницу / Could not read page: \(url.lastPathComponent)" }
+                        document.insert(page,at: document.pageCount)
+                    }
+                }
+                else if let image = NSImage(contentsOf: url),let page = PDFPage(image: image) { document.insert(page,at: document.pageCount) }
+                else { return "Не удалось прочитать скан / Could not read scan: \(url.lastPathComponent)" }
+            }
+            guard document.pageCount > 0 else { return "Отсканированные страницы не удалось прочитать / No readable scanned pages" }
+            do {
+                let data = try PDFDocumentSerializer.data(document)
+                guard let loaded = PDFDocument(data: data) else { throw PDFSourceError.document }
+                let item = PDFDocumentItem(url: FileManager.default.temporaryDirectory.appendingPathComponent("Scan.pdf"),document: loaded,preserveStreams: true)
+                item.isUntitled = true; item.recoveredFilename = "Scan.pdf"; self.insertDocument(item); self.seedSerializedData(data,item: item)
+                return nil
+            } catch { return "Не удалось собрать отсканированные страницы / Could not assemble scanned pages" }
+        }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showRasterWorkflow(item: PDFDocumentItem,view: PDFViewerView,enhancement: Bool) {
+        guard item.document.allowsCopying,manager.operationTask == nil else { return }
+        manager.rasterRequest = PDFRasterRequest(russian: manager.language == .ru,enhancement: enhancement,pageCount: item.pageCount,initialPage: item.pageIndex+1,preview: { [weak self,weak view] options,index in
+            guard let self,let view,item.document === view.document,item.document.allowsCopying,
+                  let indices = PDFPageRange.parse(options.range,count: item.pageCount),indices.contains(index),let page = item.document.page(at: index) else { throw PDFSourceError.content }
+            let bytes = try self.manager.serializedData(item),region = page.bounds(for: .cropBox)
+            let worker = Task.detached(priority: .userInitiated) {
+                let before = try PDFSnapshotRenderer.render(data: bytes,index: index,region: region,dpi: options.dpi)
+                let after = try PDFRasterEngine.process(data: bytes,indices: [index],options: options,progress: { _ in })
+                return (before,after)
+            }
+            return try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+        },deskew: { [weak self,weak view] index in
+            guard let self,let view,item.document.allowsCopying,item.document === view.document else { throw PDFSourceError.permission }
+            let bytes = try self.manager.serializedData(item)
+            let worker = Task.detached(priority: .userInitiated) { try PDFRasterEngine.suggestDeskew(data: bytes,index: index) }
+            return try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+        },detectBounds: { [weak self,weak view] index in
+            guard let self,let view,item.document.allowsCopying,item.document === view.document else { throw PDFSourceError.permission }
+            let bytes = try self.manager.serializedData(item)
+            let worker = Task.detached(priority: .userInitiated) { try PDFRasterEngine.detectBounds(data: bytes,index: index) }
+            return try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+        },detectPerspective: { [weak self,weak view] index in
+            guard let self,let view,item.document.allowsCopying,item.document === view.document else { throw PDFSourceError.permission }
+            let bytes = try self.manager.serializedData(item)
+            let worker = Task.detached(priority: .userInitiated) { try PDFRasterEngine.detectPerspective(data: bytes,index: index) }
+            return try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+        }) { [weak self] options in
+            guard let self,let indices = PDFPageRange.parse(options.range,count: item.pageCount),self.manager.operationTask == nil,(0...2).contains(options.perspectiveMode),(options.perspectiveMode != 1 || options.quad.valid),abs(options.angle) <= 20 else { return "Проверьте диапазон, угол (−20…20°) и углы перспективы / Check range, angle and perspective corners" }
+            do {
+                let data = try self.manager.serializedData(item),manager = self.manager,id = UUID()
+                manager.activeOperationID = id; manager.operationProgress = 0; manager.operationTitle = enhancement ? "Enhance / Улучшение сканов" : "Colors / Цвета"
+                manager.operationTask = Task { @MainActor in
+                    defer { manager.activeOperationID = nil; manager.operationProgress = nil; manager.operationTask = nil }
+                    do {
+                        let worker = Task.detached(priority: .userInitiated) {
+                            try PDFRasterEngine.process(data: data,indices: indices,options: options) { value in Task { @MainActor in if manager.activeOperationID == id { manager.operationProgress = value } } }
+                        }
+                        let bytes = try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+                        try Task.checkCancellation()
+                        guard let document = PDFDocument(data: bytes) else { throw PDFSourceError.document }
+                        let entry = PDFDocumentItem(url: FileManager.default.temporaryDirectory.appendingPathComponent("Raster-"+item.filename),document: document,preserveStreams: true)
+                        entry.isUntitled = true; entry.recoveredFilename = "Raster-"+item.filename
+                        manager.insertDocument(entry); manager.seedSerializedData(bytes,item: entry)
+                    } catch is CancellationError { }
+                    catch { manager.say("Raster conversion failed. Original PDF is intact.","Не удалось создать растровую копию. Исходный PDF не изменён.") }
+                }; return nil
+            } catch { return "Не удалось подготовить PDF / Cannot prepare PDF" }
+        }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showComparison(item: PDFDocumentItem) {
+        guard item.document.allowsCopying,finishSourceEditor() else { return }
+        PDFDialogs.open([.pdf]) { [weak self] urls in
+            guard let self,let url = urls.first,self.manager.selected?.id == item.id else { return }
+            let lease = FileAccessLease(url); defer { _ = lease }
+            do {
+                let left = try self.manager.serializedData(item),right = try Data(contentsOf: url)
+                guard let other = PDFDocument(data: right),!other.isLocked,other.allowsCopying else { throw PDFSourceError.permission }
+                self.manager.comparisonRequest = PDFComparisonRequest(left: left,right: right,leftName: item.filename,rightName: url.lastPathComponent,russian: self.manager.language == .ru)
+            } catch { self.sourceError(error) }
+        }
+    }
+}
+
+@MainActor private extension DocumentManager {
+    func changeAnnotation(_ annotation: PDFAnnotation,lock: Bool? = nil,visible: Bool? = nil,printable: Bool? = nil) {
+        guard let item = selected,item.document.allowsCommenting else { return }
+        recordUndo(item,group: "annotationFlags")
+        let parts: [PDFAnnotation]
+        if let group = AnnotationMetadata.group(of: annotation),let page = annotation.page { parts = page.annotations.filter { AnnotationMetadata.group(of: $0) == group } } else { parts = [annotation] }
+        for part in parts {
+            if let lock { AnnotationMetadata.setLocked(lock,on: part) }
+            if let visible { part.shouldDisplay = visible }
+            if let printable { part.shouldPrint = printable }
+        }
+        send(.refresh)
+    }
+}
+@MainActor private extension PDFViewerView {
+    func eraseInk(page: PDFPage,point: CGPoint,whole: Bool) {
+        guard document?.allowsCommenting == true else { return }
+        let radius = max(3,8/max(0.01,scaleFactor))
+        for annotation in page.annotations.reversed() where annotation.shouldDisplay && !AnnotationMetadata.isContainer(annotation) && !AnnotationMetadata.isLocked(annotation) && annotation.bounds.insetBy(dx: -radius,dy: -radius).contains(point) {
+            if whole {
+                if !eraserRecorded { onWillModify?(); eraserRecorded = true }
+                if let group = AnnotationMetadata.group(of: annotation) { for part in page.annotations where AnnotationMetadata.group(of: part) == group { page.removeAnnotation(part) } }
+                else { page.removeAnnotation(annotation) }
+                selectAnnotation(nil); setNeedsDisplay(bounds); return
+            }
+            guard annotation.type == "Ink",AnnotationMetadata.measurement(annotation) == nil,let paths = annotation.paths else { continue }
+            let local = CGPoint(x: point.x-annotation.bounds.minX,y: point.y-annotation.bounds.minY)
+            let result = PDFInkEraser.erase(paths,center: local,radius: radius)
+            guard result.changed else { continue }
+            if !eraserRecorded { onWillModify?(); eraserRecorded = true }
+            if result.paths.isEmpty { page.removeAnnotation(annotation) }
+            else { for path in paths { annotation.remove(path) }; for path in result.paths { annotation.add(path) }; AnnotationMetadata.setInkCurves(nil,on: annotation); annotation.removeValue(forAnnotationKey: .appearanceDictionary) }
+            selectAnnotation(nil); setNeedsDisplay(bounds)
+        }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showOfficeExport(item: PDFDocumentItem,format: String) {
+        guard item.document.allowsCopying,finishSourceEditor() else { return }
+        let document = item.document
+        manager.officeRequest = PDFOfficeRequest(format: format,russian: manager.language == .ru,count: item.pageCount) { [weak self] range in
+            guard let self,item.document === document,let indices = PDFPageRange.parse(range,count: item.pageCount) else { return "Invalid page range / Проверьте диапазон" }
+            self.manager.afterFeatureDismiss = { [weak self] in
+                guard let self,self.manager.operationTask == nil else { return }
+                let panel = NSSavePanel(),ext = format == "word" ? "docx" : format == "excel" ? "xlsx" : "pptx"
+                panel.nameFieldStringValue = URL(fileURLWithPath: item.filename).deletingPathExtension().lastPathComponent+"."+ext
+                panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .data]
+                panel.begin { [weak self] response in
+                    guard let self,response == .OK,let url = panel.url else { return }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,self.manager.operationTask == nil,item.document === document else { return }
+                        let lease = FileAccessLease(url),operationID = UUID()
+                        self.manager.activeOperationID = operationID; self.manager.operationTitle = "Office · "+ext.uppercased(); self.manager.operationProgress = 0
+                        self.manager.operationTask = Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            defer { self.manager.operationTask = nil; self.manager.operationProgress = nil; self.manager.activeOperationID = nil; _ = lease }
+                            do {
+                                let data = try self.manager.serializedData(item)
+                                var pages: [PDFOfficePage] = []
+                                for (position,index) in indices.enumerated() {
+                                    try Task.checkCancellation()
+                                    guard let page = document.page(at: index) else { throw PDFSourceError.page }
+                                    let crop = page.bounds(for: .cropBox),blocks = try PDFSourceSession.blocks(data: data,pageIndex: index)
+                                    let rotation = ((page.rotation%360)+360)%360
+                                    let transform = PDFFormattingGeometry.transform(page,box: .cropBox,target: CGRect(x: 0,y: 0,width: rotation%180 == 0 ? crop.width : crop.height,height: rotation%180 == 0 ? crop.height : crop.width))
+                                    var text: [PDFOfficeText] = blocks.map { descriptor -> PDFOfficeText in
+                                        let snapshot = descriptor.snapshot
+                                        return PDFOfficeText(text: snapshot.text,bounds: snapshot.bounds.applying(transform),font: snapshot.fontName,size: Double(snapshot.fontSize))
+                                    }
+                                    text.sort { left,right in
+                                        if abs(left.bounds.maxY-right.bounds.maxY) > 3 { return left.bounds.maxY > right.bounds.maxY }
+                                        return left.bounds.minX < right.bounds.minX
+                                    }
+                                    pages.append(PDFOfficePage(width: rotation%180 == 0 ? crop.width : crop.height,height: rotation%180 == 0 ? crop.height : crop.width,blocks: text))
+                                    self.manager.operationProgress = Double(position+1)/Double(indices.count)*0.8; await Task.yield()
+                                }
+                                let snapshot = pages
+                                let worker = Task.detached(priority: .userInitiated) { try PDFOfficeExporter.create(pages: snapshot,format: format) }
+                                let output = try await withTaskCancellationHandler(operation: { try await worker.value },onCancel: { worker.cancel() })
+                                try Task.checkCancellation(); try output.write(to: url,options: .atomic)
+                            } catch is CancellationError {} catch { self.sourceError(error) }
+                        }
+                    }
+                }
+            }
+            return nil
+        }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showLayerStateEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,view.document === item.document,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),report = try PDFDocumentExtras.layerStateReport(data),document = item.document,stamp = PDFDocumentState.stamp(document)
+            let apply: (PDFLayerStateConfiguration,String,[String],[Int],[Int],[Int]?) -> String? = { [weak self,weak view] entry,base,intents,on,off,locks in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён / Document changed" }
+                do {
+                    let output = try PDFDocumentExtras.setLayerState(data,entry: entry,base: base,intents: intents,on: on,off: off,locked: locks)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Проверьте Intent, ON/OFF, Locked и радиогруппы / Check intent, ON/OFF, locked states and radio groups" }
+            }
+            manager.layerStateRequest = PDFLayerStateRequest(russian: manager.language == .ru,report: report,applyWithLocks: { apply($0,$1,$2,$3,$4,$5) },apply: { apply($0,$1,$2,$3,$4,nil) })
+        } catch { manager.say("Cannot read layer configuration settings.","Не удалось прочитать параметры конфигураций слоёв.") }
+    }
+    func showLayerRadioEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,view.document === item.document,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),report = try PDFDocumentExtras.layerStateReport(data),document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.layerRadioRequest = PDFLayerRadioRequest(russian: manager.language == .ru,report: report,apply: { [weak self,weak view] entry,radios in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён / Document changed" }
+                do {
+                    let output = try PDFDocumentExtras.setLayerRadios(data,entry: entry,radios: radios)
+                    if output == data { return nil }
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Проверьте состав групп и конфликтующие ON в выбранной и наследующих конфигурациях / Check membership and conflicting ON states in this and inheriting configurations" }
+            })
+        } catch { manager.say("Cannot read layer radio groups.","Не удалось прочитать радиогруппы слоёв.") }
+    }
+    func showLayerOrderEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,view.document === item.document,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),configurations = try PDFDocumentExtras.layerOrderConfigurations(data),document = item.document,stamp = PDFDocumentState.stamp(document)
+            manager.layerOrderRequest = PDFLayerOrderRequest(russian: manager.language == .ru,configurations: configurations,layers: try PDFDocumentExtras.layerCatalogGroups(data),apply: { [weak self,weak view] entry,operation in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён / Document changed" }
+                do {
+                    let output = try PDFDocumentExtras.editLayerOrder(data,entry: entry,operation: operation)
+                    if output == data { return nil }
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                    self.layerCommand("layersRefresh",item: item,view: view); return nil
+                } catch { return "Не удалось изменить Order. Проверьте имя, выбор, вложенность и пустоту удаляемого элемента / Could not edit Order. Check title, selection, nesting and empty children" }
+            })
+        } catch { manager.say("Cannot read layer presentation order.","Не удалось прочитать порядок слоёв.") }
+    }
+    func showLayerPresetEditor(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,view.document === item.document,finishSourceEditor() else { return }
+        layerCommand("layersRefresh",item: item,view: view)
+        guard let snapshot = manager.layerSnapshot,!manager.layerPresets.isEmpty else { return }
+        let document = item.document
+        manager.layerPresetRequest = PDFLayerPresetRequest(russian: manager.language == .ru,presets: manager.layerPresets,apply: { [weak self,weak view] operation in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == snapshot.stamp,document.allowsDocumentChanges else { return "Документ изменён. Откройте редактор заново / Document changed. Reopen the editor" }
+            do {
+                let output = try PDFDocumentExtras.editLayerPreset(snapshot.data,operation: operation)
+                try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                self.layerCommand("layersRefresh",item: item,view: view); return nil
+            } catch PDFSourceError.alreadyUsed { return "Это название уже используется / This name is already used" }
+            catch { return "Проверьте название и выбранную конфигурацию / Check the name and selected configuration" }
+        })
+    }
+    func layerCommand(_ id: String,item: PDFDocumentItem,view: PDFViewerView) {
+        do {
+            if id.hasPrefix("layerLock:") {
+                let parts = id.split(separator: ":")
+                guard parts.count == 3,let number = Int(parts[1]),let state = Int(parts[2]),[0,1].contains(state),view.document === item.document,item.document.allowsDocumentChanges,
+                      let snapshot = manager.layerSnapshot,snapshot.document == ObjectIdentifier(item.document),snapshot.stamp == PDFDocumentState.stamp(item.document),let entry = manager.layerEntries.first(where: { $0.id == number }) else { throw PDFSourceError.alreadyUsed }
+                if entry.locked != (state == 1) {
+                    let output = try PDFDocumentExtras.setLayerLocked(snapshot.data,entry: entry,locked: state == 1)
+                    try installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                }
+            }
+            if id.hasPrefix("layerPreset:") {
+                guard let index = Int(id.dropFirst("layerPreset:".count)),item.document.allowsDocumentChanges,let snapshot = manager.layerSnapshot,
+                      snapshot.document == ObjectIdentifier(item.document),snapshot.stamp == PDFDocumentState.stamp(item.document),view.document === item.document else { throw PDFSourceError.alreadyUsed }
+                let output = try PDFDocumentExtras.makeLayerPresetDefault(snapshot.data,index: index)
+                try installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+            }
+            if id.hasPrefix("layerToggle:") {
+                let components = id.split(separator: ":").compactMap { Int($0) }
+                guard components.count == 2,item.document.allowsDocumentChanges,let snapshot = manager.layerSnapshot,snapshot.document == ObjectIdentifier(item.document),snapshot.stamp == PDFDocumentState.stamp(item.document),let entry = manager.layerEntries.first(where: { $0.id == components[0] }) else { throw PDFSourceError.alreadyUsed }
+                let output = try PDFDocumentExtras.setLayer(snapshot.data,entry: entry,visible: components[1] == 1)
+                try installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+            }
+            let data = try manager.serializedData(item)
+            let configuration = try PDFDocumentExtras.layerConfiguration(data)
+            manager.layerEntries = configuration.groups; manager.layerOutline = configuration.rows; manager.layerHasOrder = configuration.hasOrder
+            manager.layerPresets = try PDFDocumentExtras.layerPresets(data)
+            manager.layerSnapshot = (data,ObjectIdentifier(item.document),PDFDocumentState.stamp(item.document)); manager.layerError = nil
+        } catch {
+            manager.layerSnapshot = nil
+            manager.layerError = manager.language == .ru ? "Не удалось прочитать или изменить OCG. Обновите список; исходная страница не изменена при ошибке записи." : "Could not read or change OCG. Refresh the list; a failed write leaves the original page intact."
+        }
+    }
+    func showStructure(item: PDFDocumentItem,view: PDFViewerView) {
+        guard finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),document = item.document,stamp = PDFDocumentState.stamp(document)
+            let report = try PDFDocumentExtras.structure(data,russian: manager.language == .ru)
+            let apply: (String,PDFStructureNode?,String,PDFStructureTextChange,PDFStructureProperties) -> String? = { [weak self,weak view] language,node,alt,actualText,properties in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Document changed / Документ изменился" }
+                do {
+                    let output = try PDFDocumentExtras.setStructure(data,language: language,node: node,alternative: alt,actualText: actualText,properties: properties)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return error.localizedDescription }
+            }
+            let reorder: (PDFStructureNode,Int) -> String? = { [weak self,weak view] node,direction in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Document changed / Документ изменился" }
+                do {
+                    let output = try PDFDocumentExtras.reorderStructure(data,node: node,direction: direction)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Перестановка недоступна для выбранного узла / Cannot reorder this element" }
+            }
+            let reparent: (PDFStructureNode,PDFStructureNode?) -> String? = { [weak self,weak view] node,parent in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Document changed / Документ изменился" }
+                do {
+                    let output = try PDFDocumentExtras.reparentStructure(data,node: node,parent: parent)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Перенос к этому родителю недоступен / Cannot move to this parent" }
+            }
+            let wrap: (PDFStructureNode,String) -> String? = { [weak self,weak view] node,title in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Document changed / Документ изменился" }
+                do {
+                    let output = try PDFDocumentExtras.wrapStructure(data,node: node,title: title)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Создать контейнер вокруг этого элемента нельзя / Cannot wrap this element" }
+            }
+            let deleteEmpty: (PDFStructureNode) -> String? = { [weak self,weak view] node in
+                guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == stamp,document.allowsDocumentChanges else { return "Документ изменён / Document changed" }
+                do {
+                    let output = try PDFDocumentExtras.deleteEmptyStructure(data,node: node)
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return "Тег содержит данные, ID/описания или внутренние ссылки; удаление недоступно / Tag has content, ID/descriptions or internal references; deletion unavailable" }
+            }
+            manager.structureRequest = PDFStructureRequest(report: report,russian: manager.language == .ru,editable: document.allowsDocumentChanges,deleteEmpty: deleteEmpty,wrap: wrap,reparent: reparent,reorder: reorder,applyProperties: apply) { language,node,alt,actual in apply(language,node,alt,actual,PDFStructureProperties()) }
+
+        } catch { sourceError(error) }
+    }
+    func showLayerPolicy(_ id: String,item: PDFDocumentItem,view: PDFViewerView) {
+        guard let number = Int(id.dropFirst("layerPolicy:".count)),let entry = manager.layerEntries.first(where: { $0.id == number }),!entry.locked,
+              let snapshot = manager.layerSnapshot,snapshot.document == ObjectIdentifier(item.document),snapshot.stamp == PDFDocumentState.stamp(item.document),item.document.allowsDocumentChanges else { return }
+        let document = item.document
+        let apply: (Bool?,Bool?,[String]?,PDFLayerExtendedUsage?,String?) -> String? = { [weak self,weak view] viewState,printState,intents,extended,name in
+            guard let self,let view,item.document === document,view.document === document,PDFDocumentState.stamp(document) == snapshot.stamp,document.allowsDocumentChanges else { return "Документ изменён. Обновите список слоёв / Document changed. Refresh layers" }
+            do {
+                let output = try PDFDocumentExtras.setLayerUsage(snapshot.data,entry: entry,viewState: viewState,printState: printState,intents: intents,extended: extended,name: name)
+                try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation()
+                self.layerCommand("layersRefresh",item: item,view: view); return nil
+            } catch { return "Не удалось записать имя, Intent или Usage слоя / Could not write layer name, intent or usage" }
+        }
+        let extended = try? PDFDocumentExtras.layerExtendedUsage(snapshot.data,entry: entry)
+        let applyExtended: ((Bool?,Bool?,[String],PDFLayerExtendedUsage) -> String?)? = extended == nil ? nil : { apply($0,$1,$2,$3,nil) }
+        manager.layerPolicyRequest = PDFLayerPolicyRequest(russian: manager.language == .ru,entry: entry,applyIntent: { apply($0,$1,$2,nil,nil) },extended: extended,applyExtended: applyExtended,applyNamed: { apply($0,$1,$2,$3,$4) },apply: { apply($0,$1,nil,nil,nil) })
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showNamedDestinations(item: PDFDocumentItem,view: PDFViewerView) {
+        guard item.document.allowsDocumentChanges,finishSourceEditor() else { return }
+        do {
+            let data = try manager.serializedData(item),document = item.document,stamp = PDFDocumentState.stamp(document)
+            let targets = try PDFDocumentExtras.namedTargets(data),point = document.page(at: item.pageIndex)?.bounds(for: .cropBox).origin ?? .zero
+            manager.namedRequest = PDFNamedRequest(targets: targets,currentPage: item.pageIndex,point: point,pageCount: item.pageCount,russian: manager.language == .ru) { [weak self,weak view] targets in
+                guard let self,let view,item.document === document,PDFDocumentState.stamp(document) == stamp else { return "Document changed / Документ изменился" }
+                do {
+                    let output = try PDFDocumentExtras.writeNamedTargets(data,targets: targets,bookmarks: [:])
+                    try self.installSourceData(output,item: item,index: item.pageIndex,view: view,bounds: nil,restoreBookmarks: false); item.enableStreamPreservation(); return nil
+                } catch { return error.localizedDescription }
+            }
+        } catch { sourceError(error) }
+    }
+}
+
+@MainActor private extension PDFViewer.Coordinator {
+    func showSnapshotRegion(item: PDFDocumentItem) {
+        guard item.document.allowsCopying,manager.operationTask == nil,let source = manager.snapshotSource,source.id == item.id,let page = item.document.page(at: source.page) else { return }
+        let expected = item.document,stamp = PDFDocumentState.stamp(expected)
+        manager.regionRequest = PDFRegionRequest(page: page,region: source.region,russian: manager.language == .ru) { [weak self] region in
+            guard let self,self.manager.selected?.id == item.id,item.document === expected,PDFDocumentState.stamp(expected) == stamp,self.manager.operationTask == nil else { return "Document changed / Документ изменился" }
+            self.copySnapshot(page: page,region: region); return nil
+        }
+    }
+}
+
+@MainActor private extension PDFViewerView {
+    @discardableResult func rotateAnnotationSelection(clockwise: Bool) -> Bool {
+        rotateAnnotationSelection(degrees: clockwise ? -90 : 90)
+    }
+    @discardableResult func rotateAnnotationSelection(degrees: CGFloat) -> Bool {
+        guard canModifyAnnotationSelection,degrees.isFinite,(-360...360).contains(degrees) else { return false }
+        let angle = degrees.truncatingRemainder(dividingBy: 360),quarter = angle/90
+        let orthogonal = abs(quarter-quarter.rounded()) < 1e-10
+        let supported = orthogonal ? ["Line","Ink","Square","Circle"] : ["Line","Ink"]
+        guard selectedAnnotations.allSatisfy({ supported.contains($0.type ?? "") && AnnotationMetadata.measurement($0) == nil }) else { return false }
+        if angle == 0 { return true }
+        let radians = angle*CGFloat.pi/180
+        let cosine = orthogonal ? cos(radians).rounded() : cos(radians),sine = orthogonal ? sin(radians).rounded() : sin(radians)
+        let union = annotationSelectionBounds,center = CGPoint(x: union.midX,y: union.midY)
+        let transform = CGAffineTransform(a: cosine,b: sine,c: -sine,d: cosine,tx: center.x*(1-cosine)+center.y*sine,ty: center.y*(1-cosine)-center.x*sine)
+        return applyAnnotationSelectionTransform(transform)
+    }
+    @discardableResult func scaleAnnotationSelection(x: CGFloat,y: CGFloat) -> Bool {
+        guard canModifyAnnotationSelection,x.isFinite,y.isFinite,(0.1...10).contains(x),(0.1...10).contains(y) else { return false }
+        if x == 1 && y == 1 { return true }
+        let box = annotationSelectionBounds
+        return applyAnnotationSelectionTransform(CGAffineTransform(a: x,b: 0,c: 0,d: y,tx: box.midX*(1-x),ty: box.midY*(1-y)))
+    }
+    @discardableResult func flipAnnotationSelection(horizontal: Bool) -> Bool {
+        guard canModifyAnnotationSelection else { return false }
+        let box = annotationSelectionBounds
+        return applyAnnotationSelectionTransform(CGAffineTransform(a: horizontal ? -1 : 1,b: 0,c: 0,d: horizontal ? 1 : -1,tx: horizontal ? 2*box.midX : 0,ty: horizontal ? 0 : 2*box.midY))
+    }
+    private func applyAnnotationSelectionTransform(_ transform: CGAffineTransform) -> Bool {
+        guard canModifyAnnotationSelection,let page = selectedAnnotations.first?.page,
+              selectedAnnotations.allSatisfy({ ["Line","Ink","Square","Circle"].contains($0.type ?? "") && AnnotationMetadata.measurement($0) == nil }) else { return false }
+        struct Plan { let annotation: PDFAnnotation,box: CGRect,start: CGPoint?,end: CGPoint?,paths: [NSBezierPath]?,record: PDFInkCurveRecord? }
+        var plans: [Plan] = []
+        for annotation in selectedAnnotations {
+            if annotation.type == "Ink" {
+                guard let nodes = try? PDFInkCurveGeometry.read(annotation,record: AnnotationMetadata.inkCurves(annotation)) else { return false }
+                let rotated = PDFInkCurveGeometry.mapped(nodes) { $0.applying(transform) },probe = PDFAnnotation(bounds: annotation.bounds,forType: .ink,withProperties: nil)
+                probe.border = annotation.border
+                guard let record = PDFInkCurveGeometry.apply(rotated,to: probe),let paths = probe.paths else { return false }
+                plans.append(Plan(annotation: annotation,box: probe.bounds,start: nil,end: nil,paths: paths,record: record))
+            } else {
+                let box = annotation.bounds.applying(transform)
+                func rotated(_ p: CGPoint) -> CGPoint {
+                    let absolute = CGPoint(x: annotation.bounds.minX+p.x,y: annotation.bounds.minY+p.y).applying(transform)
+                    return CGPoint(x: absolute.x-box.minX,y: absolute.y-box.minY)
+                }
+                plans.append(Plan(annotation: annotation,box: box,start: annotation.type == "Line" ? rotated(annotation.startPoint) : nil,end: annotation.type == "Line" ? rotated(annotation.endPoint) : nil,paths: nil,record: nil))
+            }
+        }
+        let crop = page.bounds(for: .cropBox).insetBy(dx: -0.001,dy: -0.001)
+        guard plans.allSatisfy({ crop.contains($0.box) }) else { return false }
+        onWillModify?()
+        for plan in plans {
+            if let paths = plan.paths {
+                for old in plan.annotation.paths ?? [] { plan.annotation.remove(old) }
+                plan.annotation.bounds = plan.box; for path in paths { plan.annotation.add(path) }
+                AnnotationMetadata.setInkCurves(plan.record,on: plan.annotation)
+            } else {
+                plan.annotation.bounds = plan.box
+                if let start = plan.start,let end = plan.end { plan.annotation.startPoint = start; plan.annotation.endPoint = end }
+            }
+            plan.annotation.removeValue(forAnnotationKey: .appearanceDictionary)
+        }
+        refreshOverlay(); setNeedsDisplay(bounds); onAnnotationChanged?(); return true
     }
 }

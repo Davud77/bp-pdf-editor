@@ -10,6 +10,44 @@
 
 A native macOS PDF workspace built with SwiftUI, AppKit, and Apple PDFKit. Its ribbon ergonomics, dockable panels, and drafting-oriented workflows take inspiration from PDF-XChange Editor, with a bilingual Russian and English interface. Ribbon tab widths remain fixed when the active tab changes.
 
+## Version 1.9 (13)
+
+The new **Search** panel lists all matches with text snippets and page numbers.
+Click a result or use previous/next to navigate. Open it with Cmd+F, the panels
+menu, or Return in quick search. Search is case insensitive; scans require OCR first.
+
+A broad implementation batch adds shared document views/splits, batch thumbnails,
+interactive cropping, printing, attachments, measurements, explicit OCR, scanner,
+FDF/XFDF, OCG controls, named destinations, basic OOXML text exports and structure
+inspection. Native checks cover implementation and data preservation; manual and hardware acceptance remain pending.
+Version 1.9 (13) includes the accumulated features and a new search panel. See
+[implementation status](IMPLEMENTATION_STATUS.md) and [remaining roadmap](ROADMAP.md).
+
+The working tree also supports JSON bookmark Next action trees for supported
+action types and FDF/XFDF comment modification timestamps. Other action types,
+structural form editing and complete rare-annotation appearance compatibility remain.
+
+The content inspector also offers independent nested Form-resource transforms:
+translation, separate X/Y scale and rotation with ancestor copies that isolate
+other resource paths/pages. Individual child paths/text/images and Do invocations,
+complex gradients/patterns/clipping/transparency still need further editing support.
+
+## Remaining implementation
+
+The working tree adds isolated OCMD conditions for nested Image/Form resources
+and measurement copying between open PDFs. Calibrated X/Y and arbitrary-angle distance projections
+with matching dimension lines, relative label placement and editable distance/perimeter/area label leaders with up to 32 waypoints are also available. Originals remain in the source PDF;
+copies use independent groups, placement/calibration controls and destination Undo.
+These changes are included in 1.9. Local packages are in `dist/1.9/`.
+
+Remaining work covers complex navigation/TOC, native form structures and rare
+FDF/XFDF appearances, shared-object geometry, nonlinear measurement metrics and
+cross-document moves with coordinated Undo, scan dewarping/ICC, semantic comparison,
+remaining optional-content cases/Usage, encryption compatibility, irreversible
+redaction, full tagged PDF/PDF/UA, structural Office conversion and legacy decoration.
+See [ROADMAP.md](ROADMAP.md) for precise limits. Manual/hardware acceptance and
+optimization follow implementation.
+
 ## Start screen
 
 ![BotPlus PDF Editor with no open PDF](docs/images/start-screen.png)
@@ -104,7 +142,7 @@ BotPlus preserves appearance settings and callout associations in a hidden, non-
 ./build_and_deploy.sh --package-only
 ```
 
-This builds Release for arm64, signs a staging copy, creates a writable HFS+ image, mounts it, adds the app and an Applications shortcut, detaches it, converts it to compressed UDZO, and verifies the result. Output files are `dist/BotPlus-PDF-Editor.dmg` and its SHA-256 checksum. Temporary mounts are cleaned up on failure or interruption.
+This builds Release for arm64, signs a staging copy, creates a writable HFS+ image, mounts it, adds the app and an Applications shortcut, detaches it, converts it to compressed UDZO, and verifies the result. Output files are `dist/<version>/BotPlus-PDF-Editor.dmg` and its SHA-256 checksum. Temporary mounts are cleaned up on failure or interruption.
 
 ```sh
 ./build_and_deploy.sh
@@ -156,7 +194,7 @@ The inspector shows document properties until text, an image, a vector object or
 
 ### Universal release and ribbon tools
 
-The Release application and PDFium dylib contain both arm64 and x86_64 slices. CI runs native persistence checks on Apple Silicon and Intel. Implemented tools include colored/transparent highlight, underline and strikeout; editable text stamps, notes and URL/page links; rectangle, ellipse, cloud, pencil and whole-annotation eraser; PDF image content insertion; basic AcroForm fields and JSON data; bookmark tree operations, batch changes, TOC and HTML/text export; page import/extract/split/swap/crop; editable watermark/header/Bates annotations; PNG export, file merging, read-aloud and word count. Thumbnail size controls switch between a grid and one page per panel width. Dock widths stay constant between panels. Undo/Redo uses bounded document history and preserves bookmark targets. Advanced named-destination editing, calibrated measurements, OCR, cryptographic signatures, office conversion and external integrations remain under development.
+The Release application and PDFium dylib contain both arm64 and x86_64 slices. CI runs native persistence checks on Apple Silicon and Intel. Implemented tools include colored/transparent highlight, underline and strikeout; editable text stamps, notes and URL/page links; rectangle, ellipse, cloud, pencil and partial Ink erasing; PDF image content insertion; basic AcroForm fields and JSON data; bookmark tree operations, batch changes, TOC and HTML/text export; page import/extract/split/swap/crop; editable watermark/header/Bates annotations; PNG export, file merging, read-aloud and word count. Thumbnail size controls switch between a grid and one page per panel width. Dock widths stay constant between panels. Undo/Redo uses bounded document history and preserves bookmark targets. The working tree includes named-destination editing, calibrated measurements, explicit Vision OCR and basic text-based DOCX/XLSX/PPTX export. Full structural Office conversion, cryptographic signatures and unconnected external integrations remain unavailable. The current functional remainder is listed in [ROADMAP.md](ROADMAP.md).
 
 Version 1.1 supports thumbnail pinch gestures and Ctrl/Command+wheel zoom. A bounded raster cache and guarded PDFView updates reduce repeated rendering during panel gestures.
 
@@ -177,6 +215,8 @@ Queued PDF gestures are bound to their document. Unchanged selection state no lo
 ### Update 1.5
 
 Thumbnails default to panel width, with buttons and pinch/Ctrl/Command + wheel controls; no size slider. One hover router selects the PDF viewport or thumbnails independently of keyboard focus. Screen-coordinate splitters coalesce updates at 60 Hz and defer preferences writes; thumbnail rasters are reused during resizing.
+
+The current implementation uses NSCollectionView for native selection, rubber-band tracking, autoscrolling and item reuse. Arrow/Home/End/Page Up/Page Down keys navigate; Shift extends/contracts a range, Cmd+A selects all and Escape clears selection. Cmd+C/X/V and Delete target pages while the grid has focus. The `#` menu switches between PDF page labels and physical numbering. Compilation is complete; interactive acceptance remains pending.
 
 Protect → Signatures/Initials supports typing, drawing and PNG/JPEG/TIFF import, opacity, borders and up to 20 local presets. Home → Stamp shares the editor with {date}/{file}/{page} tokens. Marks can be exported as transparent PNG, are inserted at the current page center and selected in the content editor for move/scale/rotation/deletion. These are graphic marks, not certificate/PKCS#7 signatures.
 

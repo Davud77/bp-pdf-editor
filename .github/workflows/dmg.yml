@@ -33,10 +33,10 @@ jobs:
         with:
           name: BotPlus-PDF-Editor-universal
           path: |
-            dist/BotPlus-PDF-Editor.dmg
-            dist/BotPlus-PDF-Editor.dmg.sha256
-            dist/BotPlus-PDF-Editor-update.zip
-            dist/BotPlus-PDF-Editor-update.zip.sha256
+            dist/*/BotPlus-PDF-Editor.dmg
+            dist/*/BotPlus-PDF-Editor.dmg.sha256
+            dist/*/BotPlus-PDF-Editor-update.zip
+            dist/*/BotPlus-PDF-Editor-update.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 30

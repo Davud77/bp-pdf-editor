@@ -37,8 +37,8 @@
 
 `./build_and_deploy.sh --package-only` создаёт:
 
-- `dist/BotPlus-PDF-Editor.dmg` и `.dmg.sha256` — обычная установка;
-- `dist/BotPlus-PDF-Editor-update.zip` и `.zip.sha256` — установка из приложения.
+- `dist/<version>/BotPlus-PDF-Editor.dmg` и `.dmg.sha256` — обычная установка;
+- `dist/<version>/BotPlus-PDF-Editor-update.zip` и `.zip.sha256` — установка из приложения.
 
 Все четыре файла необходимо прикреплять к одному стабильному GitHub Release с тегом `vX.Y` или `vX.Y.Z`; номер должен совпадать с `CFBundleShortVersionString`. В ZIP сохраняются подписи `.app` и PDFium. После публикации релиз автоматически обнаруживается предыдущей версией **1.7 или новее**. Сборка 1.7 проверяет обе архитектуры через заголовок Mach-O, без зависимости от особенностей командной строки `lipo`.
 

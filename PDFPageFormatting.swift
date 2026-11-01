@@ -43,6 +43,9 @@ struct PDFFormattingOptions {
     var fontSize: Double = 12
     var color: Color = .black
     var opacity: Double = 1
+    var angle = 0.0
+    var backgroundMode = 1 // stretch, fit, fill, tile
+    var tileWidth = 144.0
     var alignment = 1 // Left, center, right.
     var position = 1 // Top, center, bottom.
     var batesStart = 1
@@ -103,14 +106,15 @@ enum PDFDecorationEngine {
         }
         let height = max(18, options.fontSize * 1.7)
         if kind == .header {
-            let column = max(1, (box.width - inset * 2) / 3)
+            guard validHeader(options,box: box) else { return [] }
+            let column = (box.width-options.left-options.right)/3
             let headers = [options.headerLeft, options.headerCenter, options.headerRight]
             let footers = [options.footerLeft, options.footerCenter, options.footerRight]
             let alignments: [NSTextAlignment] = [.left, .center, .right]
             for index in 0..<3 {
-                let x = box.minX + inset + CGFloat(index) * column
-                add(headers[index], rect: CGRect(x: x, y: box.maxY - inset - height, width: column, height: height), alignment: alignments[index])
-                add(footers[index], rect: CGRect(x: x, y: box.minY + inset, width: column, height: height), alignment: alignments[index])
+                let x = box.minX + options.left + CGFloat(index) * column
+                add(headers[index], rect: CGRect(x: x, y: box.maxY - options.top - height, width: column, height: height), alignment: alignments[index])
+                add(footers[index], rect: CGRect(x: x, y: box.minY + options.bottom, width: column, height: height), alignment: alignments[index])
             }
         } else {
             let lines = max(1, options.text.components(separatedBy: "\n").count)
@@ -120,6 +124,15 @@ enum PDFDecorationEngine {
                 alignment: options.alignment == 0 ? .left : (options.alignment == 2 ? .right : .center))
         }
         return result
+    }
+    static func validHeader(_ options: PDFFormattingOptions,box: CGRect) -> Bool {
+        let offsets = [options.left,options.right,options.top,options.bottom]
+        guard offsets.allSatisfy({ $0.isFinite && $0 >= 0 }),options.fontSize.isFinite,(4...200).contains(options.fontSize),[box.minX,box.minY,box.width,box.height].allSatisfy(\.isFinite) else { return false }
+        let height = max(18,options.fontSize*1.7)
+        let hasHeader = [options.headerLeft,options.headerCenter,options.headerRight].contains { !$0.isEmpty }
+        let hasFooter = [options.footerLeft,options.footerCenter,options.footerRight].contains { !$0.isEmpty }
+        let rows = (hasHeader ? 1 : 0)+(hasFooter ? 1 : 0)
+        return box.width-options.left-options.right > 3 && box.height-options.top-options.bottom >= height*Double(rows)
     }
 }
 
@@ -137,6 +150,11 @@ struct PDFFormattingEditor: View {
     let request: PDFFormattingRequest
     @Environment(\.dismiss) private var dismiss
     @StateObject private var state: PDFFormattingEditorModel
+    @State private var unit = PageGeometryUnit.pt
+    @State private var largePreview = false
+    @State private var headerPresets = PDFHeaderPresetStore.load()
+    @State private var presetID: UUID?
+    @State private var presetName = ""
     init(request: PDFFormattingRequest) {
         self.request = request
         var initial = PDFFormattingOptions()
@@ -173,6 +191,7 @@ struct PDFFormattingEditor: View {
                         ? text("Preview does not change the document.", "Предпросмотр не изменяет документ.")
                         : text("This page is outside the selected range.", "Эта страница вне выбранного диапазона."))
                         .font(.caption).foregroundStyle(.secondary)
+                    Button(text("Enlarge preview…","Увеличить предпросмотр…")) { largePreview = true }
                 }
             }
             if let error = state.error { Text(error).foregroundStyle(.red).font(.caption).frame(maxWidth: .infinity, alignment: .leading) }
@@ -185,6 +204,12 @@ struct PDFFormattingEditor: View {
                 Button(text(request.kind == .images ? "Export…" : "Apply", request.kind == .images ? "Экспортировать…" : "Применить")) { submit(remove: false) }.keyboardShortcut(.defaultAction)
             }
         }.padding(20).frame(width: 770, height: 600)
+        .sheet(isPresented: $largePreview) {
+            VStack {
+                PDFFormattingPreview(request: request,options: state.options,pageIndex: state.previewPage)
+                Button(text("Done","Готово")) { largePreview = false }.keyboardShortcut(.cancelAction)
+            }.padding(16).frame(width: 850,height: 720)
+        }
     }
     private func submit(remove: Bool) {
         if let message = request.apply(state.options, remove) { state.error = message }
@@ -203,9 +228,38 @@ struct PDFFormattingEditor: View {
     private func number(_ name: String, _ value: Binding<Double>) -> some View {
         HStack { Text(name); Spacer(); TextField("", value: value, format: .number).frame(width: 82) }
     }
+    private func distance(_ name: String,_ value: Binding<Double>) -> some View {
+        number(name,Binding(get: { value.wrappedValue/unit.factor },set: { value.wrappedValue = $0*unit.factor }))
+    }
+    private var headerControls: some View {
+        VStack(alignment: .leading,spacing: 10) {
+            Picker(text("Units","Единицы"),selection: $unit) { ForEach(PageGeometryUnit.allCases) { Text($0.title).tag($0) } }
+            Text(text("Insets from CropBox, in page coordinates","Отступы от CropBox, в координатах страницы")).font(.caption)
+            distance(text("Left","Слева"),$state.options.left); distance(text("Right","Справа"),$state.options.right)
+            distance(text("Top","Сверху"),$state.options.top); distance(text("Bottom","Снизу"),$state.options.bottom)
+            Picker(text("Saved template","Сохранённый шаблон"),selection: $presetID) {
+                Text(text("Choose…","Выбрать…")).tag(Optional<UUID>.none)
+                ForEach(headerPresets) { Text($0.name).tag(Optional($0.id)) }
+            }.onChange(of: presetID) { _,id in if let preset = headerPresets.first(where: { $0.id == id }) { preset.apply(to: &state.options); presetName = preset.name } }
+            TextField(text("Template name","Имя шаблона"),text: $presetName)
+            HStack {
+                Button(text("Save template","Сохранить шаблон")) {
+                    guard let preset = PDFHeaderPreset(name: presetName,options: state.options) else { state.error = text("Check name, font size, opacity and insets.","Проверьте имя, размер шрифта, непрозрачность и отступы."); return }
+                    headerPresets = PDFHeaderPresetStore.load()
+                    guard headerPresets.count < 100 || headerPresets.contains(where: { $0.name.localizedCaseInsensitiveCompare(preset.name) == .orderedSame }) else { state.error = text("Template limit: 100. Delete an unused template.","Лимит: 100 шаблонов. Удалите ненужный шаблон."); return }
+                    headerPresets.removeAll { $0.name.localizedCaseInsensitiveCompare(preset.name) == .orderedSame }; headerPresets.append(preset)
+                    guard PDFHeaderPresetStore.save(headerPresets) else { headerPresets = PDFHeaderPresetStore.load(); state.error = text("Template storage is full. Delete an unused template.","Хранилище шаблонов заполнено. Удалите ненужный шаблон."); return }
+                    presetID = preset.id; state.error = nil
+                }
+                Button(text("Delete","Удалить")) { headerPresets = PDFHeaderPresetStore.load(); headerPresets.removeAll { $0.id == presetID }; PDFHeaderPresetStore.save(headerPresets); presetID = nil }.disabled(presetID == nil)
+            }
+            Text(text("Templates include text, font, color, opacity and insets. The current page range is kept.","Шаблон содержит текст, шрифт, цвет, непрозрачность и отступы. Текущий диапазон страниц сохраняется.")).font(.caption)
+        }
+    }
     private var decorationControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             if request.kind == .header {
+                headerControls
                 Text(text("Header", "Верхний колонтитул")).font(.headline)
                 TextField(text("Left", "Слева"), text: $state.options.headerLeft)
                 TextField(text("Center", "По центру"), text: $state.options.headerCenter)
@@ -223,6 +277,7 @@ struct PDFFormattingEditor: View {
                     Text(text("Left", "Слева")).tag(0); Text(text("Center", "По центру")).tag(1); Text(text("Right", "Справа")).tag(2)
                 }
             }
+            if request.kind == .watermark { number(text("Angle, degrees", "Угол, градусы"),$state.options.angle) }
             Text("{page} · {pages} · {file} · {date} · {bates}").font(.caption).textSelection(.enabled)
             if request.kind == .bates {
                 HStack {
@@ -265,6 +320,10 @@ struct PDFFormattingEditor: View {
             }
             if state.options.image != nil {
                 Text(state.options.imageName).font(.caption)
+                Picker(text("Image placement", "Размещение"),selection: $state.options.backgroundMode) {
+                    Text(text("Stretch", "Растянуть")).tag(0); Text(text("Fit", "Вписать")).tag(1); Text(text("Fill", "Заполнить")).tag(2); Text(text("Tile", "Плитка")).tag(3)
+                }
+                if state.options.backgroundMode == 3 { number(text("Tile width, pt", "Ширина плитки, pt"),$state.options.tileWidth) }
                 Button(text("Use color only", "Только цвет")) { state.options.image = nil; state.options.imageName = "" }
             }
             Text(text("Color or image is inserted behind the original content. Opaque white fills in the original may cover the background.", "Цвет или изображение вставляется за исходным содержимым. Белые непрозрачные заливки исходного PDF могут закрыть фон.")).font(.caption).foregroundStyle(.secondary)
@@ -368,7 +427,7 @@ private final class FormattingPreviewView: NSView {
         NSColor.white.setFill(); rect.fill()
         if previewApplies && request.kind == .background {
             if let cgImage = options.image {
-                context.saveGState(); context.setAlpha(options.opacity); context.draw(cgImage, in: rect); context.restoreGState()
+                context.saveGState(); context.setAlpha(options.opacity); PDFBackgroundPlacement.draw(cgImage,in: rect,mode: options.backgroundMode,tileWidth: options.tileWidth*rect.width/max(1,page.bounds(for: .cropBox).width),context: context); context.restoreGState()
             } else { PDFColorComponents(options.color, opacity: options.opacity).nsColor.setFill(); rect.fill() }
         }
         image.draw(in: rect)
@@ -380,7 +439,9 @@ private final class FormattingPreviewView: NSView {
                               width: media.width - options.left - options.right, height: media.height - options.top - options.bottom)
             context.setStrokeColor(NSColor.systemRed.cgColor); context.setLineWidth(2 / scale)
             if [crop.minX, crop.minY, crop.width, crop.height].allSatisfy({ $0.isFinite }), crop.width > 0 && crop.height > 0 { context.stroke(crop) }
-        } else if previewApplies && [.header, .watermark, .bates].contains(request.kind) {
+        } else if previewApplies && request.kind == .watermark {
+            PDFWatermarkLayer.draw(options: options,box: page.bounds(for: .cropBox),page: index,count: request.document.pageCount,filename: request.filename,sequence: 0,russian: request.russian,context: context)
+        } else if previewApplies && [.header, .bates].contains(request.kind) {
             for annotation in PDFDecorationEngine.annotations(kind: request.kind, options: options, box: page.bounds(for: .cropBox),
                 page: index, count: request.document.pageCount, filename: request.filename, sequence: (PDFPageRange.parse(options.range, count: request.document.pageCount) ?? []).firstIndex(of: index) ?? 0, russian: request.russian) {
                 let paragraph = NSMutableParagraphStyle(); paragraph.alignment = annotation.alignment
@@ -451,5 +512,106 @@ enum PDFImageExporter {
         }
         complete = true
         return options.indices.count
+    }
+}
+
+enum PDFBackgroundPlacement {
+    static func draw(_ image: CGImage,in rect: CGRect,mode: Int,tileWidth: CGFloat,context: CGContext) {
+        context.saveGState(); context.clip(to: rect); defer { context.restoreGState() }
+        let aspect = CGFloat(image.height)/CGFloat(max(1,image.width))
+        if mode == 0 { context.draw(image,in: rect); return }
+        if mode == 3 {
+            let width = max(rect.width/64,min(rect.width*4,max(1,tileWidth))),height = max(rect.height/64,width*aspect)
+            let columns = Int(ceil(rect.width/width)),rows = Int(ceil(rect.height/height))
+            guard columns*rows <= 4096 else { return }
+            for y in 0..<rows { for x in 0..<columns { context.draw(image,in: CGRect(x: rect.minX+CGFloat(x)*width,y: rect.minY+CGFloat(y)*height,width: width,height: height)) } }
+        } else {
+            let scale = mode == 2 ? max(rect.width/CGFloat(image.width),rect.height/CGFloat(image.height)) : min(rect.width/CGFloat(image.width),rect.height/CGFloat(image.height))
+            let size = CGSize(width: CGFloat(image.width)*scale,height: CGFloat(image.height)*scale)
+            context.draw(image,in: CGRect(x: rect.midX-size.width/2,y: rect.midY-size.height/2,width: size.width,height: size.height))
+        }
+    }
+    static func composed(_ image: CGImage,size: CGSize,mode: Int,tileWidth: CGFloat) throws -> CGImage {
+        let factor = min(4,4096/max(1,size.width,size.height)),width = max(1,Int(ceil(size.width*factor))),height = max(1,Int(ceil(size.height*factor)))
+        guard width*height <= 40_000_000,let context = CGContext(data: nil,width: width,height: height,bitsPerComponent: 8,bytesPerRow: width*4,space: CGColorSpaceCreateDeviceRGB(),bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw PDFSourceError.content }
+        context.scaleBy(x: factor,y: factor)
+        draw(image,in: CGRect(origin: .zero,size: size),mode: mode,tileWidth: tileWidth,context: context)
+        guard let output = context.makeImage() else { throw PDFSourceError.content }; return output
+    }
+}
+@MainActor enum PDFWatermarkLayer {
+    static func draw(options: PDFFormattingOptions,box: CGRect,page: Int,count: Int,filename: String,sequence: Int,russian: Bool,context: CGContext) {
+        let value = PDFDecorationEngine.expand(options.text,page: page,count: count,filename: filename,start: options.batesStart,digits: options.batesDigits,sequence: sequence,russian: russian)
+        let font = NSFont(name: options.fontName,size: options.fontSize) ?? NSFont.systemFont(ofSize: options.fontSize)
+        let paragraph = NSMutableParagraphStyle(); paragraph.alignment = options.alignment == 0 ? .left : options.alignment == 2 ? .right : .center
+        let text = NSAttributedString(string: value,attributes: [.font:font,.foregroundColor:PDFColorComponents(options.color,opacity: options.opacity).nsColor,.paragraphStyle:paragraph])
+        let width = max(1,box.width-36),height = min(max(1,box.height-36),max(options.fontSize*1.7,text.boundingRect(with: CGSize(width: width,height: 10000),options: [.usesLineFragmentOrigin,.usesFontLeading]).height))
+        let centerY = options.position == 0 ? box.maxY-18-height/2 : options.position == 2 ? box.minY+18+height/2 : box.midY
+        context.saveGState(); context.clip(to: box); context.translateBy(x: box.midX,y: centerY); context.rotate(by: options.angle*Double.pi/180)
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(cgContext: context,flipped: false)
+        text.draw(with: CGRect(x: -width/2,y: -height/2,width: width,height: height),options: [.usesLineFragmentOrigin,.usesFontLeading])
+        NSGraphicsContext.restoreGraphicsState(); context.restoreGState()
+    }
+    static func data(document: PDFDocument,indices: [Int],options: PDFFormattingOptions,filename: String,russian: Bool) throws -> Data {
+        let buffer = NSMutableData()
+        guard let consumer = CGDataConsumer(data: buffer as CFMutableData),let context = CGContext(consumer: consumer,mediaBox: nil,nil) else { throw PDFSourceError.content }
+        for (sequence,index) in indices.enumerated() {
+            guard let page = document.page(at: index) else { throw PDFSourceError.page }
+            var box = page.bounds(for: .mediaBox)
+            let encoded = NSData(bytes: &box,length: MemoryLayout<CGRect>.size)
+            context.beginPDFPage([kCGPDFContextMediaBox as String:encoded] as CFDictionary)
+            draw(options: options,box: page.bounds(for: .cropBox),page: index,count: document.pageCount,filename: filename,sequence: sequence,russian: russian,context: context)
+            context.endPDFPage()
+        }
+        context.closePDF(); return buffer as Data
+    }
+}
+
+/// Reusable header/footer settings. A range is intentionally not part of a
+/// template, so applying one cannot silently retarget the current document.
+struct PDFHeaderPreset: Codable, Identifiable, Sendable {
+    var id = UUID()
+    let name: String
+    let headerLeft: String,headerCenter: String,headerRight: String
+    let footerLeft: String,footerCenter: String,footerRight: String
+    let left: Double,right: Double,top: Double,bottom: Double
+    let fontName: String,fontSize: Double,red: Double,green: Double,blue: Double,opacity: Double
+    var valid: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.count <= 80 &&
+        [headerLeft,headerCenter,headerRight,footerLeft,footerCenter,footerRight].allSatisfy { $0.utf16.count <= 32000 } &&
+        [headerLeft,headerCenter,headerRight,footerLeft,footerCenter,footerRight].reduce(0) { $0+$1.utf8.count } <= 64000 &&
+        [left,right,top,bottom].allSatisfy { $0.isFinite && (0...14400).contains($0) } &&
+        fontName.count <= 256 && fontSize.isFinite && (4...200).contains(fontSize) &&
+        [red,green,blue,opacity].allSatisfy { $0.isFinite && (0...1).contains($0) }
+    }
+    @MainActor init?(name: String,options: PDFFormattingOptions) {
+        self.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        headerLeft = options.headerLeft; headerCenter = options.headerCenter; headerRight = options.headerRight
+        footerLeft = options.footerLeft; footerCenter = options.footerCenter; footerRight = options.footerRight
+        left = options.left; right = options.right; top = options.top; bottom = options.bottom
+        fontName = options.fontName; fontSize = options.fontSize
+        let color = PDFColorComponents(options.color,opacity: options.opacity)
+        red = color.red; green = color.green; blue = color.blue; opacity = options.opacity
+        guard valid else { return nil }
+    }
+    @MainActor func apply(to options: inout PDFFormattingOptions) {
+        guard valid else { return }
+        options.headerLeft = headerLeft; options.headerCenter = headerCenter; options.headerRight = headerRight
+        options.footerLeft = footerLeft; options.footerCenter = footerCenter; options.footerRight = footerRight
+        options.left = left; options.right = right; options.top = top; options.bottom = bottom
+        options.fontName = fontName; options.fontSize = fontSize
+        options.color = Color(red: red,green: green,blue: blue); options.opacity = opacity
+    }
+}
+@MainActor enum PDFHeaderPresetStore {
+    private static let key = "BotPlus.HeaderFooterPresets.v1"
+    static func load(defaults: UserDefaults = .standard) -> [PDFHeaderPreset] {
+        guard let data = defaults.data(forKey: key),data.count <= 8_000_000,let values = try? JSONDecoder().decode([PDFHeaderPreset].self,from: data) else { return [] }
+        var ids = Set<UUID>(),names = Set<String>()
+        return values.prefix(100).filter { $0.valid && ids.insert($0.id).inserted && names.insert($0.name.lowercased()).inserted }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+    @discardableResult static func save(_ presets: [PDFHeaderPreset],defaults: UserDefaults = .standard) -> Bool {
+        guard let data = try? JSONEncoder().encode(Array(presets.filter(\.valid).prefix(100))),data.count <= 8_000_000 else { return false }
+        defaults.set(data,forKey: key); return true
     }
 }

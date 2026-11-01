@@ -10,6 +10,8 @@
 #include "fpdf_annot.h"
 #include "fpdf_save.h"
 #include "fpdf_ppo.h"
+#include "fpdf_attachment.h"
+#include "fpdf_doc.h"
 #include "fpdf_transformpage.h"
 #ifdef __cplusplus
 extern "C" {
