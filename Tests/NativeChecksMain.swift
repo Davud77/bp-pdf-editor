@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 BotPlus
 
+import ObjectiveC
+
 
 
 extension PDFViewerView {
@@ -125,7 +127,7 @@ struct NativeChecks {
 
         for rotation in [0, 90, 180, 270] {
             activePage.rotation = rotation
-            pdf.document = nil; pdf.document = item.document; pdf.scaleFactor = 1.5
+            pdf.installDocument(nil); pdf.installDocument(item.document); pdf.scaleFactor = 1.5
             pdf.go(to: activePage); pdf.layoutDocumentView(); pdf.layoutSubtreeIfNeeded()
             let sample = CGPoint(x: 110, y: 240)
             let mapped = pdf.convert(sample, from: activePage)
@@ -136,7 +138,7 @@ struct NativeChecks {
             expect(abs(manager.rulerMetrics.horizontalPointsPerPixel) > 0.001, "horizontal ruler has a real PDF-space derivative")
             expect(abs(manager.rulerMetrics.verticalPointsPerPixel) > 0.001, "vertical ruler has a real PDF-space derivative")
         }
-        activePage.rotation = 0; pdf.document = nil; pdf.document = item.document; pdf.scaleFactor = 1.5
+        activePage.rotation = 0; pdf.installDocument(nil); pdf.installDocument(item.document); pdf.scaleFactor = 1.5
         pdf.go(to: activePage); pdf.layoutDocumentView(); pdf.layoutSubtreeIfNeeded()
         coordinator.checkSync(view: pdf)
         let beforePan = manager.rulerMetrics
@@ -361,7 +363,7 @@ struct NativeChecks {
         // the async formatting suite only after legacy viewport checks finish.
         let status = FormattingCheckStatus()
         Task { @MainActor in
-            do { try await checkSearchPanel(root: root); try await checkStructuralGraphics(root: root); try await checkFormatting(root: root) }
+            do { try await checkPDFKitBackgroundGetter(); try checkAppDiagnostics(root: root); try await checkSearchPanel(root: root); try await checkStructuralGraphics(root: root); try await checkFormatting(root: root) }
             catch { status.error = error }
             status.finished = true
         }
@@ -598,7 +600,7 @@ private func checkStructureReadingOrder(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("reading-order.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showStructure(item: item,view: view)
     let request = manager.structureRequest!,selected = request.report.nodes.first { $0.title == "B" }!
     expect(request.reorder?(selected,-1) == nil,"structure order command installs catalog transaction")
@@ -612,7 +614,7 @@ private func checkStructureReadingOrder(root: URL) throws {
     manager.undoDocument(redo: true)
     let redo = try PDFDocumentExtras.structure(manager.serializedData(item),russian: false)
     expect(redo.nodes.map(\.title) == ["B","A","A1","A2","C"],"Redo restores logical order change")
-    view.document = item.document; coordinator.showStructure(item: item,view: view)
+    view.installDocument(item.document); coordinator.showStructure(item: item,view: view)
     let parentEditor = manager.structureRequest!,sourceB = parentEditor.report.nodes.first { $0.title == "B" }!,targetA = parentEditor.report.nodes.first { $0.title == "A" }!
     expect(parentEditor.reparent?(sourceB,targetA) == nil,"reparent editor installs atomic tree transaction")
     expect(parentEditor.reparent?(sourceB,targetA) != nil,"stale parent editor rejects replaced document")
@@ -625,7 +627,7 @@ private func checkStructureReadingOrder(root: URL) throws {
     manager.undoDocument(redo: true)
     let parentRedo = try PDFDocumentExtras.structure(manager.serializedData(item),russian: false)
     expect(parentRedo.nodes.first { $0.title == "B" }?.depth == 1,"Redo restores new parent")
-    view.document = item.document; coordinator.showStructure(item: item,view: view)
+    view.installDocument(item.document); coordinator.showStructure(item: item,view: view)
     let wrapperEditor = manager.structureRequest!,toWrap = wrapperEditor.report.nodes.first { $0.title == "B" }!
     expect(wrapperEditor.wrap?(toWrap,"Wrapped") == nil,"Div creation installs atomic structure transaction")
     expect(wrapperEditor.wrap?(toWrap,"Duplicate") != nil,"stale Div editor cannot create another container")
@@ -666,7 +668,7 @@ private func checkAnnotationBatchSelection(root: URL) throws {
     manager.insertDocument(item); manager.tool = .selectComments
     let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 650,height: 700)),window = NSWindow(contentRect: view.frame,styleMask: [.titled],backing: .buffered,defer: false)
     window.isReleasedWhenClosed = false; window.contentView = view; defer { window.close() }
-    view.document = document; view.activeTool = .selectComments
+    view.installDocument(document); view.activeTool = .selectComments
     let coordinator = PDFViewer.Coordinator(manager: manager); coordinator.attach(view)
     view.selectAnnotation(line); view.selectAnnotation(square,extending: true)
     expect(view.selectedAnnotations.count == 2 && view.annotationSelectionUnitCount == 2 && view.selectedAnnotation === square,"extended selection preserves primary clicked object")
@@ -687,11 +689,11 @@ private func checkAnnotationBatchSelection(root: URL) throws {
     item.historyDate = .distantPast
     expect(view.translateAnnotationSelection(dx: 20,dy: 15) && line.bounds == beforeLine.offsetBy(dx: 20,dy: 15) && square.bounds == beforeSquare.offsetBy(dx: 20,dy: 15),"group movement preserves relative geometry")
     expect(line.endLineStyle == .openArrow && line.endPoint == CGPoint(x: 100,y: 5),"moving group preserves local endpoints and arrow style")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     expect(view.selectedAnnotations.isEmpty && view.selectedAnnotation == nil,"document replacement clears obsolete selection references")
     func find(_ name: String) -> PDFAnnotation { item.document.page(at: 0)!.annotations.first { $0.contents == name }! }
     expect(nearPoint(absolute(find("Batch line"),find("Batch line").startPoint),beforeStart) && nearPoint(absolute(find("Batch line"),find("Batch line").endPoint),beforeEnd) && near(find("Batch square").bounds,beforeSquare),"Undo restores moved geometry despite native arrow-bounds normalization")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     expect(nearPoint(absolute(find("Batch line"),find("Batch line").endPoint),CGPoint(x: beforeEnd.x+20,y: beforeEnd.y+15)),"Redo restores group move")
     let currentLine = find("Batch line"),currentSquare = find("Batch square"),currentInk = find("Batch ink")
     view.selectAnnotations([currentLine,currentSquare]); AnnotationMetadata.setLocked(true,on: currentSquare)
@@ -745,10 +747,10 @@ private func checkAnnotationBatchSelection(root: URL) throws {
     let expectedScaledControl = CGPoint(x: scaleBox.midX+(preScaleControl.x-scaleBox.midX)*1.1,y: scaleBox.midY+(preScaleControl.y-scaleBox.midY)*0.9)
     expect(nearPoint(scaledInk[1].control1,expectedScaledControl) && currentLine.border?.lineWidth == 2,"group scale maps editable controls and keeps stroke width")
     expect(scaleRequest.apply(110,90) != nil,"old scale editor rejects changed geometry")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     let scaleUndoInk = find("Batch ink"),scaleUndoNodes = try PDFInkCurveGeometry.read(scaleUndoInk,record: AnnotationMetadata.inkCurves(scaleUndoInk))
     expect(nearPoint(scaleUndoNodes[1].control1,preScaleControl),"Undo restores full group geometry before scaling")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let scaleRedoInk = find("Batch ink"),scaleRedoNodes = try PDFInkCurveGeometry.read(scaleRedoInk,record: AnnotationMetadata.inkCurves(scaleRedoInk))
     expect(nearPoint(scaleRedoNodes[1].control1,expectedScaledControl),"Redo restores group scaling")
     view.selectAnnotations([find("Batch line"),find("Batch ink")]); coordinator.showAnnotationRotation(item: item,view: view)
@@ -763,10 +765,10 @@ private func checkAnnotationBatchSelection(root: URL) throws {
     let angleInk = find("Batch ink"),angleNodes = try PDFInkCurveGeometry.read(angleInk,record: AnnotationMetadata.inkCurves(angleInk))
     expect(nearPoint(angleNodes[1].control1,expectedAngleControl) && find("Batch line").endLineStyle == .openArrow,"arbitrary rotation maps exact controls and retains arrow ending")
     expect(angleEditor.apply(30) != nil,"angle editor rejects changed geometry")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     let angleUndo = try PDFInkCurveGeometry.read(find("Batch ink"),record: AnnotationMetadata.inkCurves(find("Batch ink")))
     expect(nearPoint(angleUndo[1].control1,preAngleControl),"Undo restores arbitrary rotation")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let angleRedo = try PDFInkCurveGeometry.read(find("Batch ink"),record: AnnotationMetadata.inkCurves(find("Batch ink")))
     expect(nearPoint(angleRedo[1].control1,expectedAngleControl),"Redo restores arbitrary rotation")
     view.selectAnnotations([find("Batch line"),find("Batch ink")])
@@ -865,7 +867,7 @@ private func checkStructureActualText(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("actual-text.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showStructure(item: item,view: view)
     let request = manager.structureRequest!
     expect(request.apply("ru-RU",request.report.nodes[0],"Описание",.set(value)) == nil,"ActualText editor installs guarded catalog transaction")
@@ -881,7 +883,7 @@ private func checkStructureActualText(root: URL) throws {
     manager.undoDocument(redo: true)
     let redo = try PDFDocumentExtras.structure(manager.serializedData(item),russian: false)
     expect(redo.nodes[0].actual == value,"Redo restores replacement text")
-    view.document = item.document; coordinator.showStructure(item: item,view: view)
+    view.installDocument(item.document); coordinator.showStructure(item: item,view: view)
     let propertyEditor = manager.structureRequest!,propertyNode = manager.structureRequest!.report.nodes[0]
     expect(propertyEditor.applyProperties?("ru-RU",propertyNode,propertyNode.alternative,.preserve,PDFStructureProperties(title: "Titre",language: "fr-CA",expansion: "Expanded")) == nil,"extended structure editor applies element properties")
     try manager.saveForClosing(item,to: item.url)
@@ -934,7 +936,7 @@ private func checkInkCurveEditing(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),item = PDFDocumentItem(url: root.appendingPathComponent("ink-curves.pdf"),document: document)
     manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     manager.selectedAnnotation = annotation; coordinator.showAnnotationVertices(item: item,view: view)
     let request = manager.pathRequest!
     expect(request.ink && request.nodes.contains { $0.kind == .curve },"annotation command opens curve-aware editor")
@@ -959,7 +961,7 @@ private func checkInkCurveEditing(root: URL) throws {
     let replacement = NSBezierPath(); replacement.move(to: .zero); replacement.line(to: CGPoint(x: 40,y: 20)); restored.add(replacement)
     let external = try PDFInkCurveGeometry.read(restored,record: restoredRecord)
     expect(external.allSatisfy { $0.kind != .curve },"mismatched native strokes invalidate stale curve metadata")
-    AnnotationMetadata.setLocked(true,on: redone); manager.selectedAnnotation = redone; manager.pathRequest = nil; view.document = item.document
+    AnnotationMetadata.setLocked(true,on: redone); manager.selectedAnnotation = redone; manager.pathRequest = nil; view.installDocument(item.document)
     coordinator.showAnnotationVertices(item: item,view: view)
     expect(manager.pathRequest == nil,"locked Ink cannot open a modifying editor")
     print("PASS: Ink cubic controls/strokes, compatible paths, metadata/save/reopen, move/resize, stale/lock guards and Undo/Redo")
@@ -1220,7 +1222,7 @@ private func checkBookmarkDestinationExchange(root: URL) throws {
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: target)!
     let item = PDFDocumentItem(url: root.appendingPathComponent("bookmark-destination-exchange.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(target,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     try coordinator.applyBookmarkExchange(decoded,item: item,view: view)
     try manager.saveForClosing(item,to: item.url)
     let saved = try PDFDocumentExtras.bookmarkExchange(Data(contentsOf: item.url))
@@ -1275,7 +1277,7 @@ private func checkTabTraversal(root: URL) throws {
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!
     let item = PDFDocumentItem(url: root.appendingPathComponent("tab-traversal.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showTabTraversal(item: item,view: view)
     let stale = manager.tabTraversalRequest!
     expect(stale.current == "R","Tabs editor reads original rule")
@@ -1396,7 +1398,7 @@ private func checkLayerConfiguration(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),source = PDFDocument(data: data)!,view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500))
     let item = PDFDocumentItem(url: root.appendingPathComponent("layer-policy.pdf"),document: source,preserveStreams: true)
-    manager.insertDocument(item); manager.seedSerializedData(data,item: item); view.document = source
+    manager.insertDocument(item); manager.seedSerializedData(data,item: item); view.installDocument(source)
     let coordinator = PDFViewer.Coordinator(manager: manager); coordinator.layerCommand("layersRefresh",item: item,view: view)
     let selected = manager.layerEntries.first { $0.name == "Parent" }!
     coordinator.showLayerPolicy("layerPolicy:\(selected.id)",item: item,view: view)
@@ -1412,7 +1414,7 @@ private func checkLayerConfiguration(root: URL) throws {
     expect(redone.first { $0.name == "Parent" }?.printState == false,"Redo restores edited usage")
     coordinator.layerCommand("layerPreset:0",item: item,view: view)
     expect(manager.layerError != nil,"preset action rejects the stale snapshot after Undo/Redo")
-    view.document = item.document // Mirror the view reload normally driven by SwiftUI.
+    view.installDocument(item.document) // Mirror the view reload normally driven by SwiftUI.
     coordinator.layerCommand("layersRefresh",item: item,view: view)
     coordinator.layerCommand("layerPreset:0",item: item,view: view)
     expect(manager.layerError == nil && manager.layerEntries.allSatisfy { !$0.visible },"preset menu installs default in editor")
@@ -1425,7 +1427,7 @@ private func checkLayerConfiguration(root: URL) throws {
     manager.undoDocument(redo: true)
     let redoPreset = try PDFDocumentExtras.layers(manager.serializedData(item))
     expect(redoPreset.allSatisfy { !$0.visible },"Redo restores chosen default")
-    view.document = item.document; coordinator.showLayerPresetEditor(item: item,view: view)
+    view.installDocument(item.document); coordinator.showLayerPresetEditor(item: item,view: view)
     let presetEditor = manager.layerPresetRequest!
     expect(presetEditor.apply(.create("Редактор")) == nil,"preset management applies through guarded editor transaction")
     expect(presetEditor.apply(.remove(0)) != nil,"stale preset manager cannot edit replaced document")
@@ -1537,7 +1539,7 @@ private func checkNamedDestinationLifecycle(root: URL) throws {
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),source = PDFDocument(data: fixture)!
     let item = PDFDocumentItem(url: root.appendingPathComponent("named-destination-transaction.pdf"),document: source,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(fixture,item: item)
-    let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = source
+    let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(source)
     let coordinator = PDFViewer.Coordinator(manager: manager)
     coordinator.showNamedDestinations(item: item,view: view)
     expect(manager.namedRequest!.apply(renamed) == nil,"named destination editor installs rewritten source transaction")
@@ -1600,7 +1602,7 @@ private func checkContinuedDevelopment(root: URL) throws {
     let note = PDFAnnotation(bounds: CGRect(x: 5,y: 5,width: 10,height: 10),forType: .text,withProperties: nil); note.contents = "keep note"
     page.addAnnotation(list); page.addAnnotation(note); page.addAnnotation(text)
     let nonWidgetSlots = page.annotations.enumerated().filter { $0.element.type != "Widget" }.map { ($0.offset,ObjectIdentifier($0.element)) }
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 700)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 700)); view.installDocument(document)
     coordinator.showFormOrder(item: item,view: view)
     expect(manager.formOrderRequest!.apply([text,list]) == nil,"form order applies through guarded UI transaction")
     expect(page.annotations.filter { $0.type == "Widget" }.map(ObjectIdentifier.init) == [text,list].map(ObjectIdentifier.init) && nonWidgetSlots.allSatisfy { ObjectIdentifier(page.annotations[$0.0]) == $0.1 },"field ordering preserves non-widget annotation slots")
@@ -1802,7 +1804,7 @@ private func checkTOCAndMerge(root: URL) throws {
     do { _ = try PDFTOCRenderer.render(entries: entries,options: options); fatalError("invalid font accepted") } catch PDFTOCError.options { }
 
     // Apply the same preview through the actual coordinator, then reopen and undo it.
-    let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 600)); view.document = source
+    let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 600)); view.installDocument(source)
     coordinator.createTOC(item: item,view: view)
     let request = manager.tocRequest!
     options = PDFTOCOptions(); options.columns = 2
@@ -2664,13 +2666,13 @@ private func checkZoomSafety() throws {
     let original = PDFDocument(); original.insert(PDFRasterizer.textPage("ZOOM ORIGINAL")!, at: 0)
     let other = PDFDocument(); other.insert(PDFRasterizer.textPage("ZOOM OTHER")!, at: 0)
     let view = PDFViewerView(frame: CGRect(x: 0, y: 0, width: 500, height: 500))
-    view.document = original; view.autoScales = false; view.scaleFactor = 1
+    view.installDocument(original); view.autoScales = false; view.scaleFactor = 1
     let anchor = CGPoint(x: 250, y: 250)
     for _ in 0..<100 { view.checkQueuedMagnify(0.002, anchor: anchor) }
     view.checkFlushMagnify()
     expect(abs(view.scaleFactor - exp(0.2)) < 0.001, "100 gesture events are coalesced without lost deltas")
     view.checkQueuedMagnify(0.5, anchor: anchor)
-    view.document = other; view.scaleFactor = 1
+    view.installDocument(other); view.scaleFactor = 1
     view.checkFlushMagnify()
     expect(abs(view.scaleFactor - 1) < 0.001, "old document gesture does not zoom a newly selected document")
     view.checkQueuedMagnify(0.05, anchor: anchor); view.checkQueuedMagnify(-0.05, anchor: anchor); view.checkFlushMagnify()
@@ -2699,7 +2701,7 @@ private func checkHoverRoutingAndSplitter() throws {
     window.isReleasedWhenClosed = false
     let root = NSView(frame: CGRect(x: 0, y: 0, width: 700, height: 500)); window.contentView = root
     let thumbnails = ThumbnailGestureView(frame: CGRect(x: 0, y: 0, width: 200, height: 500)); thumbnails.manager = manager
-    let pdf = PDFViewerView(frame: CGRect(x: 206, y: 0, width: 494, height: 500)); pdf.document = manager.selected!.document; pdf.scaleFactor = 1
+    let pdf = PDFViewerView(frame: CGRect(x: 206, y: 0, width: 494, height: 500)); pdf.installDocument(manager.selected!.document); pdf.scaleFactor = 1
     root.addSubview(thumbnails); root.addSubview(pdf); window.orderFront(nil)
     defer { thumbnails.stop(); pdf.stopEventMonitoring(); window.orderOut(nil) }
     let router = HoverGestureRouter.shared
@@ -2986,7 +2988,7 @@ private func checkUpdatePolicies(root: URL) throws {
     document.insert(page,at: 0); document.insert(small,at: 1)
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),item = PDFDocumentItem(url: root.appendingPathComponent("header-insets.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     expect(coordinator.applyFormatting(.header,options: options,remove: false,item: item,view: view) == nil,"custom header insets install")
     var bad = options; bad.range = "all"; bad.top = 80
     let history = item.undoHistory.count,originalText = page.annotations.map(\.contents)
@@ -3094,7 +3096,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("ocmd.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showMembershipEditor(item: item,view: view)
     let request = manager.membershipRequest!,selected = request.configuration.entries.first { $0.id == 8 }!
     expect(request.apply(selected,[5,6],"AnyOff",nil) == nil,"OCMD editor installs catalog transaction")
@@ -3155,7 +3157,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),targetPage = PDFPage(); targetPage.setBounds(CGRect(x: 0,y: 0,width: 500,height: 500),for: .mediaBox); document.insert(targetPage,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("fdf-comments.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     var badPage = parsed.entries[0]; badPage.attributes["page"] = "9"
     let beforeHistory = item.undoHistory.count
     expect(!coordinator.applyExchangedComments([parsed.entries[0],badPage],item: item,view: view) && targetPage.annotations.isEmpty && item.undoHistory.count == beforeHistory,"comment import validates all page targets before any mutation/history")
@@ -3196,7 +3198,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage(); page.setBounds(CGRect(x: 0,y: 0,width: 600,height: 600),for: .mediaBox); document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("transformed-measure.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 200,y: 300),CGPoint(x: 400,y: 300)],view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!
     AnnotationMetadata.setOpacity(0.4,on: ink)
@@ -3221,10 +3223,10 @@ private func checkUpdatePolicies(root: URL) throws {
     let saved = PDFDocument(url: item.url)!; AnnotationMetadata.restore(saved)
     let savedMeasure = saved.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!
     expect(abs(savedMeasure.value-original.value) < 0.000001 && savedMeasure.dimensionOffset == -original.dimensionOffset!,"transformed measurement metadata survives save/reopen")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     let undoMeasure = item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!
     expect(undoMeasure.dimensionOffset == original.dimensionOffset,"Undo restores dimension-side metadata")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first?.dimensionOffset == -original.dimensionOffset!,"Redo restores reflected measurement")
     let small = PDFPage(); small.setBounds(CGRect(x: 0,y: 0,width: 100,height: 100),for: .mediaBox); item.document.insert(small,at: 1)
     coordinator.commitEngineering(page: small,kind: .distance,points: [CGPoint(x: 20,y: 50),CGPoint(x: 80,y: 50)],view: view)
@@ -3244,7 +3246,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage(); page.setBounds(CGRect(x: 0,y: 0,width: 800,height: 800),for: .mediaBox); document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("batch-measurements.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 150,y: 250),CGPoint(x: 250,y: 250)],view: view)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 450,y: 450),CGPoint(x: 550,y: 450)],view: view)
     let inks = page.annotations.filter { AnnotationMetadata.measurement($0) != nil },old = inks.map { AnnotationMetadata.measurement($0)! }
@@ -3270,10 +3272,10 @@ private func checkUpdatePolicies(root: URL) throws {
     try manager.saveForClosing(item,to: item.url)
     let saved = PDFDocument(url: item.url)!; AnnotationMetadata.restore(saved)
     expect(saved.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.allSatisfy { abs($0.value-old[0].value*2) < 0.00001 },"batch scale metadata saves/reopens")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     let undone = item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }
     expect(undone.count == 2 && undone.allSatisfy { $0.scale.millimetersPerPoint == old[0].scale.millimetersPerPoint },"Undo restores whole batch calibration")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.allSatisfy { $0.scale.millimetersPerPoint == old[0].scale.millimetersPerPoint*2 },"Redo restores whole batch calibration")
     print("PASS: batch measurement scale/calibration policies, length/area values, one-step atomic history, locks/selection/page isolation and save/Undo/Redo")
 }
@@ -3337,7 +3339,7 @@ private func checkUpdatePolicies(root: URL) throws {
     let suite = "BotPlusLayerSettings-"+UUID().uuidString,defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("config-settings.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showLayerStateEditor(item: item,view: view)
     let request = manager.layerStateRequest!,entry = request.report.configurations.first { $0.id == 0 }!
     expect(request.applyWithLocks?(entry,"OFF",["View"],[6,7],[5],[5]) == nil,"configuration settings and alternative locks install in one transaction")
@@ -3447,7 +3449,7 @@ private func checkUpdatePolicies(root: URL) throws {
     let suite = "BotPlusEmptyTag-"+UUID().uuidString,defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("empty-tag.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showStructure(item: item,view: view)
     let request = manager.structureRequest!,node = request.report.nodes.first { $0.title == "Empty" }!
     expect(request.deleteEmpty?(node) == nil,"empty-tag command installs atomic structure transaction")
@@ -3493,7 +3495,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage(); page.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("affine-measure.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 200,y: 300),CGPoint(x: 300,y: 300)],view: view)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 500,y: 300),CGPoint(x: 600,y: 300)],view: view)
     let inks = page.annotations.filter { AnnotationMetadata.measurement($0) != nil },before = inks.map { AnnotationMetadata.measurement($0)! }
@@ -3514,10 +3516,10 @@ private func checkUpdatePolicies(root: URL) throws {
     try manager.saveForClosing(item,to: item.url)
     let saved = PDFDocument(url: item.url)!; AnnotationMetadata.restore(saved)
     expect(saved.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.allSatisfy { close($0.value,before[0].value) },"affine calibration and measurement metadata save/reopen")
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     let undone = item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }
     expect(undone.allSatisfy { $0.scale.millimetersPerPoint == before[0].scale.millimetersPerPoint },"Undo restores pre-affine calibration")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.contains { $0.scale.millimetersPerPoint != before[0].scale.millimetersPerPoint },"Redo restores affine calibration")
     print("PASS: affine/nonuniform/shear measurement transforms, common/custom pivots, signed dimension normals, calibration policies, singular guards and save/Undo/Redo")
 }
@@ -3574,7 +3576,7 @@ private func checkUpdatePolicies(root: URL) throws {
     let suite = "BotPlusExtendedUsage-"+UUID().uuidString,defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("usage.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.layerCommand("layersRefresh",item: item,view: view); coordinator.showLayerPolicy("layerPolicy:5",item: item,view: view)
     let request = manager.layerPolicyRequest!
     expect(request.extended == initial && request.applyExtended != nil,"usage editor loads extended properties")
@@ -3645,7 +3647,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("metadata.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.layerCommand("layersRefresh",item: item,view: view); coordinator.showLayerPolicy("layerPolicy:5",item: item,view: view)
     let request = manager.layerPolicyRequest!
     expect(request.extended?.metadata == initial.metadata,"metadata is available in layer policy editor")
@@ -3677,7 +3679,7 @@ private func checkUpdatePolicies(root: URL) throws {
     try EngineeringCalibration.write(EngineeringScale(millimetersPerPoint: 2,unit: .mm),page: source)
     let item = PDFDocumentItem(url: root.appendingPathComponent("measure-transfer.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
     manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: source,kind: .distance,points: [CGPoint(x: 200,y: 250),CGPoint(x: 300,y: 250)],view: view)
     coordinator.commitEngineering(page: source,kind: .area,points: [CGPoint(x: 400,y: 350),CGPoint(x: 450,y: 350),CGPoint(x: 400,y: 400)],view: view)
     let inks = source.annotations.filter { AnnotationMetadata.measurement($0) != nil },before = inks.map { AnnotationMetadata.measurement($0)! },sourceCalibration = EngineeringCalibration.read(source)!
@@ -3715,9 +3717,9 @@ private func checkUpdatePolicies(root: URL) throws {
         expect(close(measure.points[0].x-savedCrop.minX,old.points[0].x-20+10) && close(measure.points[0].y-savedCrop.minY,old.points[0].y-40+5),"saved metadata follows PDFKit MediaBox normalization relative to CropBox")
         expect(vertices.count >= measure.points.count && zip(vertices,measure.points).allSatisfy { close($0.0.point.x,$0.1.x) && close($0.0.point.y,$0.1.y) },"reopened editable measurement points match native Ink geometry")
     }
-    manager.undoDocument(redo: false); view.document = item.document
+    manager.undoDocument(redo: false); view.installDocument(item.document)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.count == 2 && item.document.page(at: 1)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.isEmpty,"one Undo restores source page and destination")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let currentTarget = item.document.page(at: 1)!,currentSource = item.document.page(at: 0)!,currentInks = currentTarget.annotations.filter { AnnotationMetadata.measurement($0) != nil }
     expect(currentInks.count == 2,"Redo restores destination families")
     try EngineeringCalibration.write(EngineeringScale(millimetersPerPoint: 3,unit: .mm),page: currentSource)
@@ -3764,7 +3766,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("layer-lock.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.layerCommand("layersRefresh",item: item,view: view)
     coordinator.layerCommand("layerLock:5:0",item: item,view: view)
     expect(manager.layerError == nil && manager.layerEntries.first { $0.id == 5 }?.locked == false,"layer lock button installs source transaction")
@@ -3867,7 +3869,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("radios.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showLayerRadioEditor(item: item,view: view)
     let request = manager.layerRadioRequest!,beforeHistory = item.undoHistory.count
     expect(request.apply(primary,primary.radios) == nil && item.undoHistory.count == beforeHistory,"unchanged radio list creates no history")
@@ -3941,7 +3943,7 @@ private func checkUpdatePolicies(root: URL) throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("layer-order.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showLayerOrderEditor(item: item,view: view)
     let request = manager.layerOrderRequest!,history = item.undoHistory.count
     expect(request.apply(entry,.move([1],1)) == nil && item.undoHistory.count == history+1,"Order editor applies one history transaction")
@@ -4011,7 +4013,7 @@ private func orderAuthoringFixture(order: String = "[5 0 R [6 0 R] [(Existing) 7
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("order-sections.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showLayerOrderEditor(item: item,view: view)
     let request = manager.layerOrderRequest!,history = item.undoHistory.count
     expect(request.layers.count == 4 && request.apply(original,.renameSection([1],"Existing")) == nil && item.undoHistory.count == history,"editor supplies catalog layers and preserves no-op history")
@@ -4070,7 +4072,7 @@ private func orderAuthoringFixture(order: String = "[5 0 R [6 0 R] [(Existing) 7
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("order-parents.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showLayerOrderEditor(item: item,view: view)
     let request = manager.layerOrderRequest!,history = item.undoHistory.count
     expect(request.apply(original,.reparent([0,0],[0])) == nil && item.undoHistory.count == history,"no-op reparenting does not create Undo")
@@ -4126,7 +4128,7 @@ private func orderAuthoringFixture(order: String = "[5 0 R [6 0 R] [(Existing) 7
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("created-ocmd.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showMembershipEditor(item: item,view: view)
     let request = manager.membershipRequest!,history = item.undoHistory.count
     expect(request.create?(name,[5,6],"AllOn",nil) == nil && item.undoHistory.count == history+1,"creation editor installs one atomic document transaction")
@@ -4228,7 +4230,7 @@ private func membershipBindingFixture(secondTail: String? = nil) -> Data {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("page-binding.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item); item.selectedPages = [0,1]
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showMembershipBindingEditor(item: item,view: view)
     let request = manager.membershipBindingRequest!,history = item.undoHistory.count
     expect(request.pageCount == 3 && request.selectedPages == [0,1] && request.apply(hidden,[0,1]) == nil && item.undoHistory.count == history+1,"binding dialog captures page selection and commits whole range as one operation")
@@ -4240,7 +4242,7 @@ private func membershipBindingFixture(secondTail: String? = nil) -> Data {
     manager.undoDocument(redo: true)
     expect(dark(pixels(try manager.serializedData(item),0)) == 0,"Redo restores assignment")
     let invalidDocument = PDFDocument(data: invalid)!,invalidItem = PDFDocumentItem(url: root.appendingPathComponent("invalid-binding.pdf"),document: invalidDocument,preserveStreams: true)
-    manager.insertDocument(invalidItem); manager.seedSerializedData(invalid,item: invalidItem); view.document = invalidDocument
+    manager.insertDocument(invalidItem); manager.seedSerializedData(invalid,item: invalidItem); view.installDocument(invalidDocument)
     coordinator.showMembershipBindingEditor(item: invalidItem,view: view)
     expect(manager.membershipBindingRequest!.apply(hidden,[0,1]) != nil && invalidItem.document === invalidDocument && invalidItem.undoHistory.isEmpty,"failed page in a range leaves document and history intact")
     print("PASS: page OCMD assignment/reassignment/removal, exact original streams, PDFium visibility, shared/inherited resources, inline images/scopes, ownership/range/stale guards and save/Undo/Redo")
@@ -4325,7 +4327,7 @@ private func directMembershipFixture() -> Data {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("direct-ocmd.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showMembershipEditor(item: item,view: view)
     let request = manager.membershipRequest!,history = item.undoHistory.count
     expect(request.configuration.entries.contains { $0.directLocation != nil } && request.apply(resource,[7,8],"AnyOn",nil) == nil && item.undoHistory.count == history+1,"direct editor installs atomic owner rewrite")
@@ -4425,7 +4427,7 @@ private func xObjectConditionFixture(tagged: Bool = false) -> Data {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("xobject-condition.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showXObjectConditionEditor(item: item,view: view)
     let request = manager.xObjectConditionRequest!,history = item.undoHistory.count
     expect(request.targets.count == 3 && request.apply(image,nil) == nil && item.undoHistory.count == history,"resource editor exposes page resources and no-op clear")
@@ -4525,7 +4527,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("nested-xobject.pdf"),document: document,preserveStreams: true)
     manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500)); view.installDocument(document)
     coordinator.showXObjectConditionEditor(item: item,view: view)
     let request = manager.xObjectConditionRequest!,history = item.undoHistory.count
     expect(request.targets.contains { $0.path == path } && request.apply(leaf,hidden) == nil && item.undoHistory.count == history+1,"nested resource editor performs one atomic transaction")
@@ -4552,7 +4554,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     manager.insertDocument(output); manager.insertDocument(item); manager.engineeringUnit = .mm
     let sibling = PDFDocumentItem(shared: output.store,page: 1,zoom: 1); manager.insertDocument(sibling); manager.select(item.id)
     try EngineeringCalibration.write(EngineeringScale(millimetersPerPoint: 2,unit: .mm),page: page)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = source
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(source)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 200,y: 250),CGPoint(x: 300,y: 250)],view: view)
     coordinator.commitEngineering(page: page,kind: .area,points: [CGPoint(x: 400,y: 350),CGPoint(x: 450,y: 350),CGPoint(x: 400,y: 400)],view: view)
     let inks = page.annotations.filter { AnnotationMetadata.measurement($0) != nil },measures = inks.map { AnnotationMetadata.measurement($0)! },parts = page.annotations.filter { AnnotationMetadata.group(of: $0) != nil },boxes = parts.map(\.bounds),groups = Set(parts.compactMap { AnnotationMetadata.group(of: $0) })
@@ -4604,7 +4606,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     manager.undoDocument(redo: true)
     expect(output.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.count == 2 && sibling.document === output.document,"Redo restores copies across shared destination views")
     // A second copy creates independent families and can adopt destination scale.
-    manager.select(item.id); view.document = source; view.selectAnnotations(inks)
+    manager.select(item.id); view.installDocument(source); view.selectAnnotations(inks)
     let latest = output.document.page(at: 0)!,existingGroups = Set(latest.annotations.compactMap { AnnotationMetadata.group(of: $0) })
     expect(coordinator.transferMeasurements(inks,options: EngineeringTransferOptions(pageIndex: 0,centered: true,useTargetScale: true),item: item,view: view,destination: output),"repeated copy can use destination calibration and centering")
     let newInks = latest.annotations.filter { AnnotationMetadata.measurement($0) != nil && !existingGroups.contains(AnnotationMetadata.group(of: $0) ?? "") }
@@ -4641,7 +4643,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     try EngineeringCalibration.write(old.scale,page: page)
     let item = PDFDocumentItem(url: root.appendingPathComponent("directional.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: old.points,view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,group = AnnotationMetadata.group(of: ink)!,originalBounds = ink.bounds,history = item.undoHistory.count
     expect(coordinator.setMeasurementAxis(ink,axis: .horizontal,item: item,view: view),"horizontal projection applies to existing calibrated measurement")
@@ -4667,7 +4669,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.axis == .horizontal,"Undo restores prior axis and dimensions")
     manager.undoDocument(redo: true)
-    let currentPage = item.document.page(at: 0)!,current = currentPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!; view.document = item.document
+    let currentPage = item.document.page(at: 0)!,current = currentPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!; view.installDocument(item.document)
     expect(AnnotationMetadata.measurement(current)!.axis == .vertical,"Redo restores directional measurement")
     expect(coordinator.setMeasurementAxis(current,axis: .aligned,item: item,view: view) && close(AnnotationMetadata.measurement(current)!.value,old.value),"aligned mode restores original distance")
     let boundaryHistory = item.undoHistory.count,currentGroup = AnnotationMetadata.group(of: current)!
@@ -4705,7 +4707,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     try EngineeringCalibration.write(old.scale,page: page)
     let item = PDFDocumentItem(url: root.appendingPathComponent("custom-direction.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: old.points,view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,group = AnnotationMetadata.group(of: ink)!,box = ink.bounds,history = item.undoHistory.count
     coordinator.showMeasurementDirection(ink,item: item,view: view)
@@ -4733,7 +4735,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(zip(vertices,savedMeasure.points).allSatisfy { close($0.0.point.x,$0.1.x) && close($0.0.point.y,$0.1.y) },"saved arbitrary projection retains editable native Ink")
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.axis == .aligned,"Undo restores original Euclidean metric")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let current = item.document.page(at: 0)!.annotations.first { AnnotationMetadata.measurement($0) != nil }!
     expect(AnnotationMetadata.measurement(current)!.direction == 45,"Redo restores angle and projected dimensions")
     let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 900,height: 900),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -4753,7 +4755,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage()
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("measurement-leader.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 250,y: 300),CGPoint(x: 350,y: 360)],view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!,label = page.annotations.first { AnnotationMetadata.group(of: $0) == group && $0.type == "FreeText" }!,originalLabel = label.bounds,history = item.undoHistory.count
     func lines(_ page: PDFPage,_ group: String) -> [PDFAnnotation] { page.annotations.filter { AnnotationMetadata.group(of: $0) == group && AnnotationMetadata.decoration(of: $0) == "engineeringDimension" } }
@@ -4790,7 +4792,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(savedMeasure.labelOffset == CGPoint(x: 100,y: 80) && savedMeasure.labelLeader == true && lines(savedPage,savedGroup).count == 4,"leader and relative placement survive normalized-origin PDF save/reopen")
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.labelOffset == nil,"one Undo restores automatic label")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let currentPage = item.document.page(at: 0)!,current = currentPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,currentGroup = AnnotationMetadata.group(of: current)!
     expect(lines(currentPage,currentGroup).count == 4,"Redo restores vector connector")
     let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -4798,7 +4800,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(coordinator.transferMeasurements([current],options: EngineeringTransferOptions(pageIndex: 0,centered: true),item: item,view: view,destination: output),"leader family can be copied to another PDF")
     let copied = outputPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,copiedGroup = AnnotationMetadata.group(of: copied)!
     expect(AnnotationMetadata.measurement(copied)!.labelOffset == CGPoint(x: 100,y: 80) && copiedGroup != currentGroup && lines(outputPage,copiedGroup).count == 4,"copy retains relative placement/connector in independent group")
-    view.document = output.document; view.selectAnnotation(copied)
+    view.installDocument(output.document); view.selectAnnotation(copied)
     var actual = EngineeringAffineOptions(); actual.degrees = 15; actual.preservingValue = false
     expect(coordinator.transformMeasurements([copied],options: actual,item: output,view: view),"complete leader family supports affine transaction")
     let transformed = AnnotationMetadata.measurement(copied)!,expectedOffset = CGPoint(x: 100,y: 80).applying(actual.linear!)
@@ -4829,7 +4831,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage()
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("elbow-leader.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 250,y: 300),CGPoint(x: 350,y: 360)],view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!
     func lines(_ page: PDFPage,_ group: String) -> [PDFAnnotation] { page.annotations.filter { AnnotationMetadata.group(of: $0) == group && AnnotationMetadata.decoration(of: $0) == "engineeringDimension" } }
@@ -4854,7 +4856,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(savedMeasure.leaderElbow == CGPoint(x: 40,y: 20) && lines(savedPage,savedGroup).count == 5,"relative knee and vector legs survive PDF save/reopen")
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.leaderElbow == nil,"one Undo removes knee and displaced label")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let current = item.document.page(at: 0)!.annotations.first { AnnotationMetadata.measurement($0) != nil }!
     expect(AnnotationMetadata.measurement(current)!.leaderElbow == CGPoint(x: 40,y: 20),"Redo restores knee")
     let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -4862,7 +4864,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(coordinator.transferMeasurements([current],options: EngineeringTransferOptions(pageIndex: 0,centered: true),item: item,view: view,destination: output),"elbow family copies across PDF documents")
     let copied = outputPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,copiedGroup = AnnotationMetadata.group(of: copied)!
     expect(lines(outputPage,copiedGroup).count == 5 && AnnotationMetadata.measurement(copied)!.leaderElbow == CGPoint(x: 40,y: 20),"copy retains independent knee metadata and both legs")
-    view.document = output.document; view.selectAnnotation(copied)
+    view.installDocument(output.document); view.selectAnnotation(copied)
     var affine = EngineeringAffineOptions(); affine.degrees = 90; affine.preservingValue = false
     expect(coordinator.transformMeasurements([copied],options: affine,item: output,view: view),"full elbow family supports affine operation")
     let transformed = AnnotationMetadata.measurement(copied)!
@@ -4891,7 +4893,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage()
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("polyline-leader.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 250,y: 300),CGPoint(x: 350,y: 360)],view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!,history = item.undoHistory.count
     func lines(_ page: PDFPage,_ group: String) -> [PDFAnnotation] { page.annotations.filter { AnnotationMetadata.group(of: $0) == group && AnnotationMetadata.decoration(of: $0) == "engineeringDimension" } }
@@ -4925,7 +4927,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(AnnotationMetadata.measurement(savedInk)!.leaderWaypoints == waypoints && lines(savedPage,savedGroup).count == 7,"ordered relative vertices and vector legs survive PDF save/reopen")
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.leaderWaypoints == reordered,"Undo restores previous vertex order")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let current = item.document.page(at: 0)!.annotations.first { AnnotationMetadata.measurement($0) != nil }!
     expect(AnnotationMetadata.measurement(current)!.leaderWaypoints == waypoints,"Redo restores route")
     let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -4933,7 +4935,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(coordinator.transferMeasurements([current],options: EngineeringTransferOptions(pageIndex: 0,centered: true),item: item,view: view,destination: output),"complete polyline family copies across documents")
     let copied = outputPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,copiedGroup = AnnotationMetadata.group(of: copied)!
     expect(AnnotationMetadata.measurement(copied)!.leaderWaypoints == waypoints && lines(outputPage,copiedGroup).count == 7,"copy retains independent route geometry and metadata")
-    view.document = output.document; view.selectAnnotation(copied)
+    view.installDocument(output.document); view.selectAnnotation(copied)
     var affine = EngineeringAffineOptions(); affine.degrees = 90; affine.preservingValue = false
     expect(coordinator.transformMeasurements([copied],options: affine,item: output,view: view),"complete polyline family transforms atomically")
     let transformed = AnnotationMetadata.measurement(copied)!
@@ -4965,7 +4967,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage()
     page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("leader-anchor.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.commitEngineering(page: page,kind: .distance,points: [CGPoint(x: 250,y: 300),CGPoint(x: 350,y: 360)],view: view)
     let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!
     func lines(_ page: PDFPage,_ group: String) -> [PDFAnnotation] { page.annotations.filter { AnnotationMetadata.group(of: $0) == group && AnnotationMetadata.decoration(of: $0) == "engineeringDimension" } }
@@ -4996,7 +4998,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(savedMeasure.effectiveLeaderAnchor == .measuredEnd && close(endpoints(lines(savedPage,savedGroup)[3]).0,savedMeasure.points.last!),"anchor survives normalized-origin PDF save/reopen with exact native start point")
     manager.undoDocument(redo: false)
     expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.effectiveLeaderAnchor == .measuredStart,"Undo restores previous attachment")
-    manager.undoDocument(redo: true); view.document = item.document
+    manager.undoDocument(redo: true); view.installDocument(item.document)
     let current = item.document.page(at: 0)!.annotations.first { AnnotationMetadata.measurement($0) != nil }!
     expect(AnnotationMetadata.measurement(current)!.effectiveLeaderAnchor == .measuredEnd,"Redo restores selected anchor")
     let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -5004,7 +5006,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
     expect(coordinator.transferMeasurements([current],options: EngineeringTransferOptions(pageIndex: 0,centered: true),item: item,view: view,destination: output),"anchored route copies across PDF documents")
     let copied = outputPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,copiedGroup = AnnotationMetadata.group(of: copied)!
     expect(AnnotationMetadata.measurement(copied)!.effectiveLeaderAnchor == .measuredEnd,"copy preserves anchor semantics")
-    view.document = output.document; view.selectAnnotation(copied)
+    view.installDocument(output.document); view.selectAnnotation(copied)
     var affine = EngineeringAffineOptions(); affine.degrees = 90; affine.preservingValue = false
     expect(coordinator.transformMeasurements([copied],options: affine,item: output,view: view),"anchored route supports full affine transaction")
     let transformed = AnnotationMetadata.measurement(copied)!
@@ -5031,7 +5033,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
         let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage()
         page.setBounds(CGRect(x: -20,y: 10,width: 800,height: 800),for: .mediaBox); page.rotation = 90; document.insert(page,at: 0)
         let item = PDFDocumentItem(url: root.appendingPathComponent(kind.rawValue+"-leader.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.engineeringUnit = .mm
-        let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+        let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
         coordinator.commitEngineering(page: page,kind: kind,points: points,view: view)
         let ink = page.annotations.first { AnnotationMetadata.measurement($0) != nil }!,original = AnnotationMetadata.measurement(ink)!,group = AnnotationMetadata.group(of: ink)!,label = page.annotations.first { AnnotationMetadata.group(of: $0) == group && $0.type == "FreeText" }!,originalBox = label.bounds
         func lines(_ page: PDFPage,_ group: String) -> [PDFAnnotation] { page.annotations.filter { AnnotationMetadata.group(of: $0) == group && AnnotationMetadata.decoration(of: $0) == "engineeringDimension" } }
@@ -5062,7 +5064,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
         expect(savedMeasure.kind == kind && savedMeasure.labelOffset == CGPoint(x: 100,y: 80) && lines(savedPage,savedGroup).count == 4 && hypot(start(lines(savedPage,savedGroup)[0]).x-savedMeasure.contourLeaderMidpoint!.x,start(lines(savedPage,savedGroup)[0]).y-savedMeasure.contourLeaderMidpoint!.y) < 0.0001,"contour anchor and route survive normalized-origin PDF save/reopen")
         manager.undoDocument(redo: false)
         expect(item.document.page(at: 0)!.annotations.compactMap { AnnotationMetadata.measurement($0) }.first!.labelOffset == nil,"one Undo restores original contour label")
-        manager.undoDocument(redo: true); view.document = item.document
+        manager.undoDocument(redo: true); view.installDocument(item.document)
         let current = item.document.page(at: 0)!.annotations.first { AnnotationMetadata.measurement($0) != nil }!
         expect(AnnotationMetadata.measurement(current)!.labelOffset == CGPoint(x: 100,y: 80),"Redo restores contour leader")
         let outputDocument = PDFDocument(),outputPage = PDFPage(); outputPage.setBounds(CGRect(x: 0,y: 0,width: 1000,height: 1000),for: .mediaBox); outputDocument.insert(outputPage,at: 0)
@@ -5070,7 +5072,7 @@ private func nestedXObjectConditionFixture(cycle: Bool = false,foreign: Bool = f
         expect(coordinator.transferMeasurements([current],options: EngineeringTransferOptions(pageIndex: 0,centered: true),item: item,view: view,destination: output),"contour leader copies between PDFs")
         let copied = outputPage.annotations.first { AnnotationMetadata.measurement($0) != nil }!,copiedGroup = AnnotationMetadata.group(of: copied)!
         expect(lines(outputPage,copiedGroup).count == 4,"copied contour family includes all leader legs")
-        view.document = output.document; view.selectAnnotation(copied)
+        view.installDocument(output.document); view.selectAnnotation(copied)
         var affine = EngineeringAffineOptions(); affine.degrees = 90; affine.preservingValue = false
         expect(coordinator.transformMeasurements([copied],options: affine,item: output,view: view),"contour family supports full affine operation")
         let transformed = AnnotationMetadata.measurement(copied)!
@@ -5131,7 +5133,7 @@ private func bookmarkChainFixture(mode: String = "normal") -> Data {
     let suite = "BotPlusActionChains-"+UUID().uuidString,defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),item = PDFDocumentItem(url: root.appendingPathComponent("bookmark-chains.pdf"),document: PDFDocument(data: data)!,preserveStreams: true); manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = item.document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(item.document)
     let history = item.undoHistory.count
     do { try coordinator.applyBookmarkExchange([invalid],item: item,view: view); fatalError("invalid chain installed") } catch { }
     expect(item.undoHistory.count == history,"invalid chain rejected before Undo")
@@ -5164,7 +5166,7 @@ private func bookmarkChainFixture(mode: String = "normal") -> Data {
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(),page = PDFPage(); page.setBounds(CGRect(x: 0,y: 0,width: 300,height: 300),for: .mediaBox); document.insert(page,at: 0)
     let item = PDFDocumentItem(url: root.appendingPathComponent("comment-dates.pdf"),document: document,preserveStreams: true); manager.insertDocument(item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     let history = item.undoHistory.count
     expect(!coordinator.applyExchangedComments([entries[0],invalid],item: item,view: view) && page.annotations.isEmpty && item.undoHistory.count == history,"invalid date cancels complete import before mutation/history")
     expect(coordinator.applyExchangedComments(read.entries,item: item,view: view) && item.undoHistory.count == history+1,"dated annotations imported in one transaction")
@@ -5234,7 +5236,7 @@ private func bookmarkChainFixture(mode: String = "normal") -> Data {
     let suite = "BotPlusFormTransform-"+UUID().uuidString,defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     let manager = DocumentManager(recent: RecentPDFStore(defaults: defaults)),document = PDFDocument(data: data)!,item = PDFDocumentItem(url: root.appendingPathComponent("form-transform.pdf"),document: document,preserveStreams: true); manager.insertDocument(item); manager.seedSerializedData(data,item: item)
-    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.document = document
+    let coordinator = PDFViewer.Coordinator(manager: manager),view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 600,height: 600)); view.installDocument(document)
     coordinator.showFormResourceTransform(item: item,view: view)
     let request = manager.formResourceTransformRequest!,history = item.undoHistory.count
     expect(request.targets.allSatisfy { $0.kind == "Form" } && request.apply(selected,PDFFormResourceTransformOptions()) == nil && item.undoHistory.count == history,"Form dialog exposes nested groups and no-op history")
@@ -5295,4 +5297,78 @@ private func checkSearchPanel(root: URL) async throws {
     manager.runSearch(); try await finish(); manager.open(url.deletingLastPathComponent().appendingPathComponent("native-checks.pdf"))
     expect(manager.searchMatches.isEmpty,"tab change clears matches")
     print("PASS: search panel, all matches/snippets, native navigation, next/previous, Cyrillic, cancellation and stale query/document/revision protection")
+}
+
+
+private final class BackgroundPDFViewRead: @unchecked Sendable {
+    let view: PDFView
+    let expected: PDFDocument
+    init(view: PDFView, expected: PDFDocument) { self.view = view; self.expected = expected }
+}
+
+@MainActor
+private func checkPDFKitBackgroundGetter() async throws {
+    func expect(_ value: @autoclosure () -> Bool, _ message: String) {
+        if !value() { fatalError("BACKGROUND PDFKIT CHECK FAILED: \(message)") }
+    }
+    let selector = NSSelectorFromString("document")
+    let inherited = class_getInstanceMethod(PDFView.self, selector)!
+    let actual = class_getInstanceMethod(PDFViewerView.self, selector)!
+    expect(unsafeBitCast(method_getImplementation(inherited),to: UInt.self) == unsafeBitCast(method_getImplementation(actual),to: UInt.self),"PDFKit getter has no Swift actor thunk")
+    let view = PDFViewerView(frame: CGRect(x: 0,y: 0,width: 500,height: 500))
+    defer { view.installDocument(nil); view.stopEventMonitoring() }
+    let first = PDFDocument(); let page = PDFPage(); first.insert(page,at: 0)
+    let note = PDFAnnotation(bounds: CGRect(x: 20,y: 20,width: 50,height: 30),forType: .text,withProperties: nil); page.addAnnotation(note)
+    view.installDocument(first); view.selectAnnotation(note)
+    expect(view.selectedAnnotation === note,"selection fixture")
+    let second = PDFDocument(); second.insert(PDFPage(),at: 0)
+    view.installDocument(second)
+    expect(view.selectedAnnotation == nil && view.selectedAnnotations.isEmpty,"document replacement resets selection")
+    let read = BackgroundPDFViewRead(view: view,expected: second)
+    let matches = await Task.detached {
+        for _ in 0..<200 {
+            guard read.view.value(forKey: "document") as? PDFDocument === read.expected else { return false }
+        }
+        return true
+    }.value
+    expect(matches,"background Objective-C document getter survives formFillingQueue call pattern")
+    print("PASS: PDFKit background document getter without actor trap and main-thread document replacement/selection reset")
+}
+
+private func checkAppDiagnostics(root: URL) throws {
+    func expect(_ value: @autoclosure () -> Bool, _ message: String) {
+        if !value() { fatalError("DIAGNOSTICS CHECK FAILED: \(message)") }
+    }
+    let directory = root.appendingPathComponent("diagnostics",isDirectory: true)
+    let logger = try AppDiagnostics(directory: directory,maximumBytes: 1024,retainedFiles: 3)
+    try Data("old run".utf8).write(to: directory.appendingPathComponent(".active-2147483647"))
+    logger.startSession()
+    func logs() throws -> [URL] { try FileManager.default.contentsOfDirectory(at: directory,includingPropertiesForKeys: nil).filter { $0.pathExtension == "log" } }
+    var bytes = try logs().map { try Data(contentsOf: $0) }.reduce(Data(),+)
+    expect(String(decoding: bytes,as: UTF8.self).contains("previous_session_ended_without_clean_shutdown"),"unclean prior run recorded")
+    logger.record("newline\nforged-event")
+    bytes = try logs().map { try Data(contentsOf: $0) }.reduce(Data(),+)
+    expect(String(decoding: bytes,as: UTF8.self).contains("newline forged-event"),"app events cannot inject log lines")
+    logger.captureStandardError()
+    FileHandle.standardError.write(Data("diagnostic-stderr-probe\n".utf8))
+    var captured = false
+    for _ in 0..<200 {
+        bytes = try logs().map { try Data(contentsOf: $0) }.reduce(Data(),+)
+        if String(decoding: bytes,as: UTF8.self).contains("diagnostic-stderr-probe") { captured = true; break }
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    logger.stopCapturingStandardError()
+    expect(captured,"runtime stderr captured without a main-thread dependency")
+    DispatchQueue.concurrentPerform(iterations: 200) { index in logger.record("concurrent-event \(index) " + String(repeating: "x",count: 100)) }
+    logger.append(Data(repeating: 65,count: 7000)); logger.record("final-event"); logger.finishSession()
+    let files = try logs()
+    expect(files.count <= 3,"bounded retained file count")
+    let sizesValid = try files.allSatisfy { try Data(contentsOf: $0).count <= 1024 }
+    expect(sizesValid,"file size bounded, including oversized writes")
+    bytes = try files.map { try Data(contentsOf: $0) }.reduce(Data(),+)
+    expect(String(decoding: bytes,as: UTF8.self).contains("final-event"),"latest event retained after rotation")
+    expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent(".active-\(getpid())").path),"clean exit removes run marker")
+    let mode = try FileManager.default.attributesOfItem(atPath: files[0].path)[.posixPermissions] as! NSNumber
+    expect(mode.intValue & 0o077 == 0,"logs readable only by their user")
+    print("PASS: local diagnostics, concurrent writes, size/count rotation, oversized writes, private permissions and session markers")
 }

@@ -11,7 +11,7 @@ import Combine
 
 private enum BotPlusBrand {
     static let name = "BotPlus PDF Editor"
-    static let version = "1.9"
+    static let version = "1.9.1"
     static let copyright = "© 2026 BotPlus"
     static let supportURL = URL(string: "https://github.com/Davud77/BotPlus-PDF-Editor")!
     static let telegramURL = URL(string: "https://t.me/botplus_pdf")!
@@ -729,7 +729,8 @@ private final class DocumentManager: ObservableObject {
                 let item = PDFDocumentItem(url: url,document: document,preserveStreams: true)
                 documents.append(item); recent.remember(url); select(item.id)
                 seedSerializedData(data,item: item)
-            } catch { say("The PDF could not be opened. Select the file again if access expired.","Не удалось открыть PDF. Если доступ истёк, выберите файл снова.") }
+                AppDiagnostics.record("document_open pages=\(document.pageCount)")
+            } catch { AppDiagnostics.error("document_open", error); say("The PDF could not be opened. Select the file again if access expired.","Не удалось открыть PDF. Если доступ истёк, выберите файл снова.") }
         }
     }
 
@@ -744,6 +745,7 @@ private final class DocumentManager: ObservableObject {
         AnnotationMetadata.restore(document)
         let item = PDFDocumentItem(url: url, document: document,preserveStreams: true)
         documents.append(item)
+        AppDiagnostics.record("document_open pages=\(document.pageCount)")
         recent.remember(url)
         select(item.id)
         if let data = try? Data(contentsOf: url,options: .mappedIfSafe) { seedSerializedData(data,item: item) }
@@ -812,7 +814,7 @@ private final class DocumentManager: ObservableObject {
         guard let selected else { say("Open a PDF first.", "Сначала откройте PDF-файл."); return }
         if selected.isUntitled { saveDocumentAs(); return }
         do { try PDFDocumentSerializer.write(try serializedData(selected),to: selected.url); selected.store.savedRevision = selected.store.revision; selected.store.savedStamp = PDFDocumentState.stamp(selected.document); recent.remember(selected.url) }
-        catch { say("Could not save the PDF.","Не удалось сохранить PDF-файл.") }
+        catch { AppDiagnostics.error("document_save", error); say("Could not save the PDF.","Не удалось сохранить PDF-файл.") }
     }
     func saveDocumentAs() {
         guard finishSourceEditing?() != false else { return }
@@ -825,7 +827,7 @@ private final class DocumentManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 do { try PDFDocumentSerializer.write(try self.serializedData(selected),to: url) }
-                catch { self.say("Could not save the PDF.","Не удалось сохранить PDF-файл."); return }
+                catch { AppDiagnostics.error("document_save_as", error); self.say("Could not save the PDF.","Не удалось сохранить PDF-файл."); return }
                 selected.url = url; selected.isUntitled = false; selected.store.savedRevision = selected.store.revision; selected.store.savedStamp = PDFDocumentState.stamp(selected.document); self.recent.remember(url); self.refreshPresentation()
             }
         }
@@ -838,6 +840,13 @@ private final class DocumentManager: ObservableObject {
         guard canPerform(action) else { return }
         if let (target, command) = thumbnailTarget(for: action) { target.performThumbnailCommand(command); return }
         if case .feature(let id) = action {
+            AppDiagnostics.record("command feature=\(id)")
+            if id == "logs" {
+                if FileManager.default.fileExists(atPath: AppDiagnostics.directory.path) {
+                    NSWorkspace.shared.open(AppDiagnostics.directory)
+                } else { say("Could not create the logs folder.","Не удалось создать папку логов.") }
+                return
+            }
             if id == "search" { panels.select(.search); return }
             if id == "license" { isLicensePresented = true; return }
             if id == "updates" { checkUpdates(); return }
@@ -1117,7 +1126,7 @@ private extension DocumentManager {
         if let (target, command) = thumbnailTarget(for: action) { return target.canPerformThumbnailCommand(command) }
         switch action {
         case .open,.settings,.toggleLanguage,.toggleRulers,.panels,.languagePicker,.themePicker,.about,.support,.telegram: return true
-        case .feature(let id) where ["license","updates","blank","fromFiles","scanner","newWindow","customize","spacing"].contains(id): return true
+        case .feature(let id) where ["license","updates","blank","fromFiles","scanner","newWindow","customize","spacing","logs"].contains(id): return true
         default: break
         }
         guard let item = selected,!item.document.isLocked else { return false }
@@ -1183,6 +1192,8 @@ private struct RibbonGroupSpec: Identifiable {
 @MainActor
 struct BotPlusPDFEditorApp {
     static func main() {
+        AppDiagnostics.shared?.startSession()
+        AppDiagnostics.shared?.captureStandardError()
         let application = NSApplication.shared
         let delegate = BotPlusAppDelegate()
         application.delegate = delegate
@@ -1199,6 +1210,7 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
     private var launched = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDiagnostics.record("application_did_finish_launching")
         launched = true
         rebuildMenus()
         showWorkspace()
@@ -1219,6 +1231,11 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
             return true
         }
         AppUpdateController.shared.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AppDiagnostics.shared?.finishSession()
+        AppDiagnostics.shared?.stopCapturingStandardError()
     }
 
     // Finder double-click, Open With, multiple-file selection and Dock drops
@@ -1429,6 +1446,7 @@ private final class BotPlusAppDelegate: NSObject, NSApplicationDelegate, NSMenuI
         responder(window, "Bring All to Front", "Все окна на передний план", "", #selector(NSApplication.arrangeInFront(_:)))
         NSApp.windowsMenu = window
         let help = menu(text("Help", "Помощь"))
+        command(help, "Open Logs Folder", "Открыть папку логов", "", .feature("logs"))
         command(help, "Support", "Поддержка", "", .support)
         command(help, "Telegram", "Телеграм", "", .telegram)
         NSApp.helpMenu = help
@@ -3044,7 +3062,7 @@ private struct PDFViewer: NSViewRepresentable {
                 view.setSourceSelection(nil)
                 view.selectAnnotation(nil)
                 Task { @MainActor [weak self] in self?.manager.selectedContent = nil }
-                view.document = manager.selected?.document
+                view.installDocument(manager.selected?.document)
                 view.configureZoomLimits()
                 if let item = manager.selected {
                     view.scaleFactor = max(view.minScaleFactor, min(view.maxScaleFactor, item.zoom))
@@ -3372,6 +3390,7 @@ private struct PDFViewer: NSViewRepresentable {
             return try manager.serializedData(item)
         }
         private func sourceError(_ error: Error) {
+            AppDiagnostics.error("source_edit", error)
             if let error = error as? PDFSourceError { manager.say(error.english, error.russian) }
             else { manager.say("Could not modify the PDF text.", "Не удалось изменить текст PDF.") }
         }
@@ -3824,8 +3843,8 @@ private struct PDFViewer: NSViewRepresentable {
             outlineGeneration += 1; outlinePending = false
             view.contentSelection = nil; view.contentPreview = nil; view.contentOutlines = []
             view.selectAnnotation(nil)
-            view.document = nil
-            view.document = item.document
+            view.installDocument(nil)
+            view.installDocument(item.document)
             view.configureZoomLimits()
             view.scaleFactor = PDFZoomLimits.clamp(zoom)
             if let page = item.document.page(at: pageIndex) {
@@ -4170,10 +4189,15 @@ private final class PDFViewerView: PDFView {
         var paths: [NSBezierPath] = []
         var recordedHistory = false
     }
-    override var document: PDFDocument? {
-        didSet {
-            if oldValue !== document { batchMove = nil; annotationMarquee = nil; transform = nil; selectAnnotation(nil) }
+    // Keep PDFView's Objective-C getter intact: PDFKit's formFillingQueue reads
+    // it off-main. An actor-isolated Swift override (even a didSet observer)
+    // synthesizes a getter thunk that traps before PDFKit can read the value.
+    func installDocument(_ next: PDFDocument?) {
+        if document !== next {
+            batchMove = nil; annotationMarquee = nil; transform = nil; selectAnnotation(nil)
         }
+        document = next
+        AppDiagnostics.record("viewer_document_changed pages=\(next?.pageCount ?? 0)")
     }
     var activeTool: PDFTool = .hand { didSet { if activeTool != oldValue { contentDrag = nil; contentPreview = nil; batchMove = nil; annotationMarquee = nil; window?.invalidateCursorRects(for: self) } } }
     var strokeColor: NSColor = .systemRed

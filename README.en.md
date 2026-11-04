@@ -10,6 +10,12 @@
 
 A native macOS PDF workspace built with SwiftUI, AppKit, and Apple PDFKit. Its ribbon ergonomics, dockable panels, and drafting-oriented workflows take inspiration from PDF-XChange Editor, with a bilingual Russian and English interface. Ribbon tab widths remain fixed when the active tab changes.
 
+## Version 1.9.1 (14)
+
+Fixes the PDFKit background form-detection crash. Adds local rotating event/stderr
+logs and **Help → Open Logs Folder**. [Diagnostics](DIAGNOSTICS.md).
+The installation package is in `dist/1.9.1/`; [GitHub release 1.9.1](https://github.com/Davud77/bp-pdf-editor/releases/tag/v1.9.1).
+
 ## Version 1.9 (13)
 
 The new **Search** panel lists all matches with text snippets and page numbers.
@@ -38,7 +44,7 @@ The working tree adds isolated OCMD conditions for nested Image/Form resources
 and measurement copying between open PDFs. Calibrated X/Y and arbitrary-angle distance projections
 with matching dimension lines, relative label placement and editable distance/perimeter/area label leaders with up to 32 waypoints are also available. Originals remain in the source PDF;
 copies use independent groups, placement/calibration controls and destination Undo.
-These changes are included in 1.9. Local packages are in `dist/1.9/`.
+These changes are included in 1.9. The local fix package is in `dist/1.9.1/`.
 
 Remaining work covers complex navigation/TOC, native form structures and rare
 FDF/XFDF appearances, shared-object geometry, nonlinear measurement metrics and
